@@ -228,6 +228,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "budwood-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "budwood-client",
+ "budwood-core",
+ "budwood-server",
+ "clap",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "budwood-server"
 version = "0.1.0"
 dependencies = [
@@ -238,9 +251,11 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

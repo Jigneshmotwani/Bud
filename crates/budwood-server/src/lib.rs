@@ -1,6 +1,8 @@
 //! The Budwood server: the authoritative changeset log for one or more
 //! repositories, content-addressed object storage, and the v1 HTTP API.
 
+pub mod blame;
+pub mod derived;
 pub mod http;
 pub mod meta;
 pub mod service;

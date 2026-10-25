@@ -81,12 +81,43 @@ pub struct DiffResponse {
     pub changes: Vec<Change>,
 }
 
+/// Body of `POST /v1/repos/{repo}/changesets/{rev}/revert`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevertRequest {
+    pub author: String,
+    /// Defaults to `Revert "<summary>"` plus a line naming the reverted revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One line of a file, attributed to the changeset that introduced it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlameLine {
+    /// 1-based line number in the file at the requested revision.
+    pub line_no: u64,
+    /// The changeset that introduced this line.
+    pub seq: u64,
+    pub id: ObjectId,
+    pub author: String,
+    pub timestamp: i64,
+    /// The line without its `\n` terminator (a `\r` is kept).
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlameResponse {
+    pub revision: Revision,
+    pub path: RepoPath,
+    pub lines: Vec<BlameLine>,
+}
+
 /// Machine-readable error codes.
 pub mod codes {
     pub const NOT_FOUND: &str = "not_found";
     pub const BAD_REQUEST: &str = "bad_request";
     pub const CONFLICT: &str = "conflict";
     pub const MISSING_OBJECTS: &str = "missing_objects";
+    pub const PAYLOAD_TOO_LARGE: &str = "payload_too_large";
     pub const UNAVAILABLE: &str = "unavailable";
     pub const INTERNAL: &str = "internal";
 }

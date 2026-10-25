@@ -18,6 +18,7 @@ clap = { version = "4.5.61", features = ["derive", "env"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+similar = "2.7.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["full"] }
 tracing = "0.1.44"
@@ -25,3 +26,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

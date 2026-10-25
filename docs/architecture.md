@@ -7,7 +7,7 @@ and layouts may change before 1.0 without a migration path.
 The code lives in three crates:
 
 - `budwood-core`: the data model and the tree algorithms, shared by everything else.
-- `budwood-server`: the authoritative changeset log, object storage and the HTTP API.
+- `budwood-server`: the authoritative changeset log, object storage, derived data (blame) and the HTTP API.
 - `budwood-client`: the HTTP client, the verified object cache, sparse workspaces and the `bud` CLI.
 
 A regional read-through cache (`budwood-cache`) is in progress and isn't covered here yet.
@@ -16,10 +16,11 @@ A regional read-through cache (`budwood-cache`) is in progress and isn't covered
  bud / tools / agents                    budwood-server
  +-----------------------+   HTTP v1   +--------------------------------------+
  | Workspace             | ----------> | Service: resolve, log, tree, diff,   |
- |   .bud/config.json    |             |          commit (+ rebase)           |
- |   .bud/state.json     | <---------- | MetaStore (SQLite): changesets,      |
- |   .bud/objects/       |   objects   |                     path_history     |
- |   (verified cache)    |   by hash   | ObjectStore (files): blobs, trees    |
+ |   .bud/config.json    |             |          commit (+ rebase), revert,  |
+ |   .bud/state.json     |             |          blame (derived data)        |
+ |   .bud/objects/       | <---------- | MetaStore (SQLite): changesets,      |
+ |   (verified cache)    |   objects   |          path_history, derived memo  |
+ |                       |   by hash   | ObjectStore (files): blobs, trees    |
  +-----------------------+             +--------------------------------------+
 ```
 
@@ -91,8 +92,9 @@ count × {
 Entries are sorted by name in strictly increasing byte order. The empty tree is `"BWT1" 00 00 00 00`.
 
 Decoding **rejects anything non-canonical**, so `decode(bytes).id()` always equals the id the bytes were stored under.
-It rejects bad magic, truncation, an unknown kind byte, names that aren't UTF-8, empty names, `.`, `..`, names
-containing `/` or NUL, entries that are unsorted or duplicated, and trailing bytes.
+It rejects bad magic, truncation, an unknown kind byte, names that aren't UTF-8, empty names, `.`, `..`, the
+reserved name `.bud` (as `RepoPath` does), names containing `/` or NUL, entries that are unsorted or duplicated, and
+trailing bytes.
 
 Trees are built and stored by the server only. Clients never upload trees. They fetch them by id and verify them by
 re-encoding and re-hashing.
@@ -207,6 +209,21 @@ Rebasing at file granularity is sound because of the conflict rule. When no path
 changed since `base`, applying the request to head gives the same files as applying it to `base` and then replaying
 the newer changesets.
 
+### 2.4 Server-side revert
+
+`POST …/changesets/{rev}/revert` (`Service::revert`) lets an automated pipeline back out a changeset without a
+working copy. The server builds the inverse changes of `{rev}`: for each path `{rev}` changed, it looks the path up
+in the parent's root tree and sets it to that `FileState`, or deletes it if it wasn't a file there. Those changes
+then go through `Service::commit` (section 2.2) with `base = {rev}.seq`, unchanged. So a revert:
+
+- is rebased over later changesets that touched other paths, and lands on head;
+- is rejected with `409 conflict` if any later changeset touched an overlapping path, because the inverse was
+  computed against `{rev}`'s state of those paths and would silently discard the later edits;
+- needs no uploads, since every restored blob is already part of history.
+
+The default message is `Revert "<summary>"`, a blank line, then `This reverts revision N (<id>).`. `bud backout REV`
+is the CLI for it.
+
 ### 2.3 Update the working copy
 
 After a successful commit, `bud` updates the workspace to the new changeset (section 4.4). Its own changes are
@@ -218,15 +235,18 @@ collide with the incoming ones, the user commits again with a newer `base`.
 
 ## 3. Derived data
 
-The changeset log is the source of truth. Everything else is derived from it:
+The changeset log is the source of truth. Everything else is derived from it, and the cost of deriving it scales
+with the change, not with the repository:
 
 - **Trees.** Each `root_tree` is computed from the parent's root plus `changes`. Trees are immutable and
   content-addressed, so they are shared freely across revisions and repositories.
 - **`path_history`.** This is a SQLite table with primary key `(repo, path, seq)` and a secondary index on
   `(repo, seq)`. It is written in the same transaction as the changeset it describes, with one row per changed file
-  path. It answers two questions:
+  path. It answers three questions:
   - *Which changesets touched this path or anything under it?* (`GET …/log?path=p`)
   - *Which paths changed between revisions `a` and `b`?* (the commit conflict check)
+  - *Which changeset last changed exactly this file, at or before revision `r`?* (blame, below)
+- **Blame**, through the generic derived-data mechanism (section 3.1).
 
 **The prefix-range trick.** Paths are stored as text, and only file paths are recorded. To find everything under
 directory `p` with an index range scan instead of a `LIKE` scan, `MetaStore::log` queries:
@@ -241,8 +261,76 @@ or `pa/b`. SQLite's default `BINARY` collation compares bytes, so this is an ind
 root path short-circuits to the plain log. The equality term also catches a file named exactly `p`, so the history
 of a path that was once a file and later a directory is complete.
 
-Not implemented yet: a blame index, and asynchronous derivation pipelines. History is linear, so the commit graph is
-just `seq` order.
+History is linear, so the commit graph is just `seq` order.
+
+### 3.1 The derived-data mechanism
+
+`crates/budwood-server/src/derived.rs` defines a `Derivation` trait. A derivation is a pure function from a key to
+a value:
+
+```rust
+trait Derivation {
+    const KIND: &'static str;          // e.g. "blame.v1"; bump the version when the format changes
+    type Key; type Inputs; type Value; // Value: Serialize + Deserialize
+    fn encode_key(key) -> String;
+    fn inputs(svc, repo, key) -> (Inputs, Vec<Key>);   // read history; list the keys this one depends on
+    fn compute(svc, repo, key, inputs, deps: Vec<Value>) -> Value;
+}
+```
+
+`derive::<D>(svc, repo, key)` returns the value, computing whatever is missing:
+
+1. Look `(repo, D::KIND, encode_key(key))` up in the `derived` table. A hit is returned as is.
+2. Otherwise evaluate depth-first with an **explicit stack** rather than recursion, so a dependency chain as long
+   as a file's whole history cannot overflow the stack. Each frame gathers its inputs and pushes the dependencies
+   that aren't memoized yet. Once they are computed, it computes its own value and stores it.
+3. Every computed value is written to the memo table (`INSERT OR IGNORE`), so it is computed at most once per server.
+   Values computed during one call are handed to their dependents in memory. A chain consumes each one once, so
+   memory stays bounded. Shared dependencies (a DAG) are computed once. Meeting a key that is still being computed
+   is reported as a cycle.
+
+```sql
+CREATE TABLE IF NOT EXISTS derived (
+    repo TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,   -- value: JSON
+    PRIMARY KEY (repo, kind, key)
+);
+```
+
+Values depend only on history, which is append-only, so rows are never invalidated. Changing a format means a new
+`KIND`. Evaluation today is **lazy**, on the first request. Eager derivation is the same `derive` call made ahead
+of time (for example by a background job after each commit). It isn't wired up, so commits stay as cheap as before.
+`Service::derivations()` counts values computed rather than served from the memo, which tests use to check that
+work is incremental.
+
+### 3.2 Blame
+
+`crates/budwood-server/src/blame.rs` implements the `blame.v1` derivation. Its key is `(path, seq)`, where `seq` is
+a changeset that changed `path`. Its value is one of:
+
+```text
+absent                      seq deleted the file
+binary                      the file contains NUL or isn't UTF-8
+text { blob, runs }         blob id of this version, and each line's origin seq, run-length encoded as [seq, count]
+```
+
+- **Inputs:** the file's `FileState` in `seq`'s root tree. **Dependency:** `(path, prev)`, where `prev` is the
+  newest changeset before `seq` that changed exactly `path`, found with one `path_history` index lookup. A deleted
+  file has no dependency, so a delete cuts the chain.
+- **Compute:** split both versions into lines and diff them (Myers, from the `similar` crate, bounded to 2 seconds
+  per pair). Lines in `Equal` runs keep their origin from `prev`'s value. Inserted and replaced lines get `seq`. If
+  `prev` was absent or binary, or there is no `prev`, every line gets `seq`. If only the kind changed (same blob),
+  the runs are copied.
+
+`GET …/blame?path=P&rev=R` resolves `R`, looks `P` up in its tree (`404` if missing, `400` for a directory), and
+finds `s`, the last changeset at or before `R` that changed `P`. The blame of `P` at `R` is the value of `(P, s)`,
+since nothing changed `P` between `s` and `R`. A `binary` value is a `400`. The server then reads the blob, splits
+it, and attaches each origin's id, author and timestamp. Those come from SQLite's `json_extract` on the stored
+changeset, so a huge changeset isn't decoded just for its author.
+
+**Cost.** Memo entries are per version of a file, never per revision of the repository. The first blame of a file
+computes one diff per version in its history (or back to its last re-add). Every later blame of any revision costs
+at most one diff per new version. Unrelated commits, however many, cost nothing. Storage is one run list per
+version, typically a few runs.
 
 ## 4. Client working copy
 
@@ -347,6 +435,8 @@ whoever receives it. The server takes advantage of this:
 - Mutable or revision-relative responses are not marked cacheable. `GET …/file` (which may name `head`) and the
   batched `POST …/objects/fetch` respond with `Cache-Control: no-cache`, and the JSON endpoints send no caching
   headers.
+- Every error response, including framework rejections, carries `Cache-Control: no-store`. A `404` for an object
+  is only true until someone uploads it, so a shared cache must never pin one.
 - The server's object store is global, shared by all repositories on that server, so identical content is stored
   once.
 
@@ -358,7 +448,7 @@ daemon that shares one cache between workspaces is on the roadmap.
 
 ```text
 <data>/
-  meta.sqlite3        repos, changesets (JSON bodies), path_history   (WAL mode, synchronous=NORMAL)
+  meta.sqlite3        repos, changesets (JSON bodies), path_history, derived   (WAL mode, synchronous=NORMAL)
   objects/ab/cdef…    one file per object
   objects/tmp/        staging for atomic writes
 ```

@@ -20,15 +20,17 @@ nothing beyond what is documented here.
 - **Revisions** (`rev`, `from`, `to`, and `{rev}` in URLs) accept:
   - `head`, or an empty or omitted value: the newest changeset.
   - `0`: the empty repository, before any changeset.
-  - A decimal sequence number such as `42`.
-  - A full 64-character changeset id. Short ids are not accepted.
+  - A decimal sequence number such as `42`. Only ASCII digits are accepted (no sign), and leading zeros are
+    ignored, so `00` is `0` and `042` is `42`.
+  - A full 64-character changeset id. Short ids are not accepted. (A 64-digit decimal string is too large for a
+    sequence number, so it is read as an id.)
 
   Surrounding whitespace is ignored. A string that is none of these returns `400`. A well-formed revision that
   doesn't exist returns `404`.
 - **Repository names** are 1–100 characters from ASCII letters, digits, `-`, `_` and `.`, and may not start with
   `.`. Every `/v1/repos/{repo}/…` route returns `404 not_found` if the repository doesn't exist.
 - **Request size:** every request body is limited by `--max-body-bytes` (default 256 MiB), which bounds the size of
-  one blob. Larger bodies are rejected with `413`.
+  one blob. Larger bodies are rejected with `413 payload_too_large`.
 - **Batch limit:** `objects/missing` and `objects/fetch` accept at most **1024** ids per request
   (`budwood_core::api::MAX_BATCH`).
 
@@ -40,6 +42,8 @@ FileState    { "kind": "file" | "executable" | "symlink", "blob": ObjectId }
 Change       { "path": RepoPath, "new": FileState | null }                   null deletes the file
 Changeset    { "id", "seq", "parent": ObjectId | null, "base": u64, "root_tree", "author", "message",
                "timestamp": i64 (Unix seconds, server-assigned), "changes": [Change] }
+BlameLine    { "line_no": u64 (1-based), "seq": u64, "id": ObjectId, "author": string, "timestamp": i64,
+               "text": string }                                        the changeset that introduced the line
 EntryKind    "file" | "executable" | "symlink" | "tree"
 ListEntry    { "name": string, "kind": EntryKind, "id": ObjectId }
 ```
@@ -49,7 +53,8 @@ ListEntry    { "name": string, "kind": EntryKind, "id": ObjectId }
 
 ## Errors
 
-Errors produced by the service have a JSON body:
+Every error has a JSON body and the header `Cache-Control: no-store`, so no HTTP cache ever stores one (a `404` for
+an object or revision may stop being true a moment later):
 
 ```json
 {
@@ -68,26 +73,30 @@ Errors produced by the service have a JSON body:
 
 | HTTP status | `code` | When |
 | --- | --- | --- |
-| 400 Bad Request | `bad_request` | Invalid path, revision, id, repository name, batch size, commit fields, or a blob whose content doesn't match its id. |
-| 404 Not Found | `not_found` | Unknown repository, revision, path or object. |
-| 409 Conflict | `conflict` | The commit overlaps newer history, or can't be applied to head (deleting a missing file, or a file/directory clash). |
+| 400 Bad Request | `bad_request` | Invalid path, revision, id, repository name, batch size, commit fields, or a blob whose content doesn't match its id. Blame of a directory or a binary file. Malformed JSON, or a query string that fails to parse (for example a missing `from` on `/diff`, or a non-numeric `limit`). |
+| 404 Not Found | `not_found` | Unknown repository, revision, path, object or route. |
+| 405 Method Not Allowed | `bad_request` | A known route called with the wrong method. |
+| 409 Conflict | `conflict` | The commit (or revert) overlaps newer history, or can't be applied to head (deleting a missing file, or a file/directory clash). |
 | 412 Precondition Failed | `missing_objects` | The commit references blobs the server doesn't have. |
+| 413 Payload Too Large | `payload_too_large` | Body larger than `--max-body-bytes`. |
+| 415 Unsupported Media Type | `bad_request` | A JSON route called without `Content-Type: application/json`. |
+| 422 Unprocessable Entity | `bad_request` | Well-formed JSON of the wrong shape, including an invalid object id inside a JSON body. |
 | 503 Service Unavailable | `unavailable` | The commit lost the append race too many times. Retry. |
 | 500 Internal Server Error | `internal` | Storage or other server failure. Details are logged on the server. |
 
-Some errors come from the HTTP framework before the request reaches the service. These have a **plain-text** body
-(or none) instead of the JSON shape above:
+Rejections that happen before a request reaches the service (`405`, `413`, `415`, `422`, and the `400`s for
+malformed JSON or query strings) keep their HTTP status but use the same JSON shape, for example:
 
-| Status | Cause |
-| --- | --- |
-| 400 | Malformed JSON body, or a query string that fails to parse (for example a missing `from` on `/diff`, or a non-numeric `limit`). |
-| 415 | A JSON route called without `Content-Type: application/json`. |
-| 422 | Well-formed JSON of the wrong shape, including an invalid object id inside a JSON body. |
-| 413 | Body larger than `--max-body-bytes`. |
-| 404 | Unknown route (empty body). |
+```text
+HTTP/1.1 415 Unsupported Media Type
+content-type: application/json
+cache-control: no-store
 
-Clients should fall back gracefully when an error body isn't JSON. `bud` reports such errors as
-`HTTP <status>: <text>`.
+{"code":"bad_request","message":"Expected request with `Content-Type: application/json`"}
+```
+
+Clients should still fall back gracefully when an error body isn't JSON (for example from a proxy). `bud` reports
+such errors as `HTTP <status>: <text>`.
 
 ## Routes
 
@@ -99,10 +108,12 @@ Clients should fall back gracefully when an error body isn't JSON. `bud` reports
 | GET | [`/v1/repos/{repo}/head`](#get-v1reposrepohead) | Current head revision |
 | GET | [`/v1/repos/{repo}/log`](#get-v1reposrepolog) | History, optionally by path |
 | GET | [`/v1/repos/{repo}/changesets/{rev}`](#get-v1reposrepochangesetsrev) | One changeset |
+| POST | [`/v1/repos/{repo}/changesets/{rev}/revert`](#post-v1reposrepochangesetsrevrevert) | Commit the inverse of a changeset |
 | POST | [`/v1/repos/{repo}/commit`](#post-v1reposrepocommit) | Append a changeset |
 | GET | [`/v1/repos/{repo}/tree`](#get-v1reposrepotree) | Look up a path or list a directory |
 | GET | [`/v1/repos/{repo}/file`](#get-v1reposrepofile) | File contents at a revision |
 | GET | [`/v1/repos/{repo}/diff`](#get-v1reposrepodiff) | File-level diff between revisions |
+| GET | [`/v1/repos/{repo}/blame`](#get-v1reposrepoblame) | Which changeset introduced each line of a file |
 | POST | [`/v1/repos/{repo}/objects/missing`](#post-v1reposrepoobjectsmissing) | Which objects the server lacks |
 | POST | [`/v1/repos/{repo}/objects/fetch`](#post-v1reposrepoobjectsfetch) | Batch fetch objects |
 | GET | [`/v1/repos/{repo}/objects/{id}`](#get-v1reposrepoobjectsid) | Fetch one object |
@@ -209,6 +220,62 @@ Returns one `Changeset` (same shape as a `log` entry). `{rev}` is any revision f
 GET /v1/repos/demo/changesets/2
 GET /v1/repos/demo/changesets/head
 GET /v1/repos/demo/changesets/095d09aafa6f3c0fe8953d3d2cda4d6221044b5bbe9fbdef377a92b79e31ae15
+```
+
+---
+
+### `POST /v1/repos/{repo}/changesets/{rev}/revert`
+
+Commits, on head, a new changeset that undoes changeset `{rev}` ("backout"). It is built for automated revert
+pipelines: no working copy or blob upload is needed. For every path that `{rev}` changed, the new changeset restores
+the state that path had in `{rev}`'s parent: the parent's `FileState`, or a delete if the path wasn't a file there.
+(Reverting a file's addition deletes it. Reverting a deletion restores the file.)
+
+The changes then go through the normal [commit path](#post-v1reposrepocommit) with `base = {rev}`'s `seq`, so they
+are rebased over newer changesets when those touched other paths, and rejected with `409 conflict` when any changeset
+after `{rev}` touched the same paths (or a directory ancestor or descendant of one). After a conflict, revert the
+later changesets first, newest first, or make the change by hand.
+
+Request (`RevertRequest`):
+
+```json
+{ "author": "revert-bot", "message": "Revert the parser change: it broke the nightly build" }
+```
+
+| Field | Rules |
+| --- | --- |
+| `author` | Required. Non-empty after trimming. |
+| `message` | Optional. Defaults to `Revert "<summary of {rev}>"`, a blank line, and `This reverts revision <seq> (<id>).` If given, it must be non-empty after trimming. |
+
+`{rev}` is any revision form except `0`, which returns `404`.
+
+Response `200`: a [`CommitResponse`](#post-v1reposrepocommit), for `POST /v1/repos/demo/changesets/2/revert` with
+`{"author":"revert-bot"}`:
+
+```json
+{
+  "changeset": {
+    "id": "0aa3c0623715d4188e783ab94c0b43d11f3423440625e5466dfc5957a2452e02",
+    "seq": 3,
+    "parent": "197289598c6c51354cf8cab25e1f88a2949485907c2e26a48a8cf9c00bdf34eb",
+    "base": 2,
+    "root_tree": "cf311188aa99cd45418f58c520ec2e88f7061b41c927f75cff83b311cb76a9e7",
+    "author": "revert-bot",
+    "message": "Revert \"Say hello\"\n\nThis reverts revision 2 (197289598c6c51354cf8cab25e1f88a2949485907c2e26a48a8cf9c00bdf34eb).",
+    "timestamp": 1792907944,
+    "changes": [
+      { "path": "main.rs", "new": { "kind": "file", "blob": "a6177c49027f1ab6cb7b1756c62e2c08772be25903bc8817fe2cb199f442eeba" } }
+    ]
+  },
+  "rebased": false
+}
+```
+
+The new changeset's `base` is the reverted revision, so `rebased` is `true` whenever other changesets landed after
+it. Errors are those of `commit`. Reverting the same revision twice conflicts with the first revert:
+
+```json
+{ "code": "conflict", "message": "1 path(s) were changed after revision 2; sync and retry", "paths": ["main.rs"] }
 ```
 
 ---
@@ -332,7 +399,7 @@ Unchanged subtrees are skipped, so the cost is proportional to the size of the d
 
 | Query | Default | Meaning |
 | --- | --- | --- |
-| `from` | **required** | Starting revision. A missing `from` is rejected with a plain-text `400`. |
+| `from` | **required** | Starting revision. A missing `from` is rejected with `400 bad_request`. |
 | `to` | `head` | Ending revision. It may be older than `from`, which gives the reverse diff. |
 | `path` | root | Only changes at or under this path. |
 
@@ -351,6 +418,53 @@ Response (`DiffResponse`), for `GET /v1/repos/demo/diff?from=1&to=3`:
 
 (Ids are abbreviated here. The API always returns full ids.) `changes` is sorted by path, and applying it to
 `from`'s tree yields `to`'s tree.
+
+---
+
+### `GET /v1/repos/{repo}/blame`
+
+For each line of a file at a revision, returns the changeset that introduced it.
+
+| Query | Default | Meaning |
+| --- | --- | --- |
+| `rev` | `head` | Revision. |
+| `path` | required | File path. The root or a directory returns `400`. |
+
+Response (`BlameResponse`), for `GET /v1/repos/demo/blame?path=main.rs`:
+
+```json
+{
+  "revision": { "seq": 2, "id": "197289598c6c…", "root_tree": "d8b8aad699c9…" },
+  "path": "main.rs",
+  "lines": [
+    { "line_no": 1, "seq": 1, "id": "27613842c6bc…", "author": "alice", "timestamp": 1792907944, "text": "fn main() {" },
+    { "line_no": 2, "seq": 2, "id": "197289598c6c…", "author": "bob", "timestamp": 1792907944, "text": "    println!(\"hello\");" },
+    { "line_no": 3, "seq": 1, "id": "27613842c6bc…", "author": "alice", "timestamp": 1792907944, "text": "}" }
+  ]
+}
+```
+
+(Ids are abbreviated here.) There is one entry per line, in order. `seq`, `id`, `author` and `timestamp` describe
+the changeset that introduced the line. Lines are split on `\n`; `text` excludes the `\n` but keeps a `\r`, and a
+final line without a terminator is still a line, so an empty file has no lines.
+
+How lines are attributed:
+
+- A line keeps its origin across versions while a line diff (Myers) between consecutive versions of the file says it
+  is unchanged. Changed and inserted lines belong to the changeset that made them. A moved block is attributed to
+  the move, since a diff keeps only the longest common subsequence.
+- History is per path. A file that is deleted and later re-added starts over: every line belongs to the re-add, even
+  if the content is identical. Renames aren't tracked, so a renamed file's lines belong to the rename.
+- A change of kind only (for example `file` to `executable`) keeps every line's origin.
+- Diffing two versions of a file is bounded to 2 seconds. Past that, the diff (and so the blame) is coarser but still
+  correct: more lines are attributed to the newer version.
+
+Errors: `400` for the root, a directory, or a binary file (one containing a NUL byte or not valid UTF-8), and `404`
+for a path that doesn't exist at that revision.
+
+Blame is [derived data](architecture.md#3-derived-data) computed lazily and memoized per version of the file, so the
+first blame of a long-lived file costs one diff per version of that file and every later one costs one diff per new
+version.
 
 ---
 

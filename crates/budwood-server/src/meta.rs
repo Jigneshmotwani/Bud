@@ -30,7 +30,24 @@ CREATE TABLE IF NOT EXISTS path_history (
     PRIMARY KEY (repo, path, seq)
 );
 CREATE INDEX IF NOT EXISTS path_history_by_seq ON path_history (repo, seq);
+-- Memoized derived data (see derived.rs), keyed by (repo, kind, key). Values
+-- are pure functions of history, so rows are never updated, only added.
+CREATE TABLE IF NOT EXISTS derived (
+    repo  TEXT NOT NULL,
+    kind  TEXT NOT NULL,
+    key   TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (repo, kind, key)
+);
 "#;
+
+/// The fields of a changeset needed to attribute something to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangesetSummary {
+    pub id: ObjectId,
+    pub author: String,
+    pub timestamp: i64,
+}
 
 pub struct MetaStore {
     conn: Mutex<Connection>,
@@ -114,6 +131,74 @@ impl MetaStore {
              ) ORDER BY seq DESC LIMIT ?6",
             params![repo, before, path.as_str(), lo, hi, limit],
         )
+    }
+
+    /// The root tree of changeset `seq`, without decoding the changeset body.
+    pub fn root_tree_at(&self, repo: &str, seq: u64) -> Result<Option<ObjectId>> {
+        let hex: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT root_tree FROM changesets WHERE repo = ?1 AND seq = ?2",
+                params![repo, seq as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        hex.map(|h| ObjectId::from_hex(&h).context("decoding root tree id")).transpose()
+    }
+
+    /// Id, author and timestamp of changeset `seq`. SQLite extracts the two
+    /// fields from the stored JSON, so a huge `changes` list isn't decoded.
+    pub fn summary(&self, repo: &str, seq: u64) -> Result<Option<ChangesetSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, json_extract(body, '$.author'), json_extract(body, '$.timestamp')
+             FROM changesets WHERE repo = ?1 AND seq = ?2",
+        )?;
+        let row = stmt
+            .query_row(params![repo, seq as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .optional()?;
+        row.map(|(id, author, timestamp)| {
+            Ok(ChangesetSummary { id: ObjectId::from_hex(&id).context("decoding changeset id")?, author, timestamp })
+        })
+        .transpose()
+    }
+
+    /// The newest changeset at or before `upto` that changed exactly `path`.
+    pub fn last_touch(&self, repo: &str, path: &RepoPath, upto: u64) -> Result<Option<u64>> {
+        let seq: Option<i64> = self.conn().query_row(
+            "SELECT MAX(seq) FROM path_history WHERE repo = ?1 AND path = ?2 AND seq <= ?3",
+            params![repo, path.as_str(), upto.min(i64::MAX as u64) as i64],
+            |row| row.get(0),
+        )?;
+        Ok(seq.map(|s| s as u64))
+    }
+
+    pub fn derived_get(&self, repo: &str, kind: &str, key: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT value FROM derived WHERE repo = ?1 AND kind = ?2 AND key = ?3")?;
+        Ok(stmt.query_row(params![repo, kind, key], |row| row.get(0)).optional()?)
+    }
+
+    /// Stores a derived value. Derivations are deterministic, so when two
+    /// requests race to compute the same key the first one wins.
+    pub fn derived_put(&self, repo: &str, kind: &str, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("INSERT OR IGNORE INTO derived (repo, kind, key, value) VALUES (?1, ?2, ?3, ?4)")?;
+        stmt.execute(params![repo, kind, key, value])?;
+        Ok(())
+    }
+
+    /// Number of memoized values of `kind` in `repo`.
+    pub fn derived_count(&self, repo: &str, kind: &str) -> Result<u64> {
+        let n: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM derived WHERE repo = ?1 AND kind = ?2",
+            params![repo, kind],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     /// Every path changed by changesets in `(after, upto]`.

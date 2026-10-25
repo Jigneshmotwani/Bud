@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use budwood_core::api::{
-    codes, CommitRequest, CommitResponse, CreateRepoRequest, DiffResponse, ErrorBody, IdList, LogResponse, RepoList,
-    Revision, TreeResponse, MAX_BATCH,
+    codes, BlameResponse, CommitRequest, CommitResponse, CreateRepoRequest, DiffResponse, ErrorBody, IdList,
+    LogResponse, RepoList, RevertRequest, Revision, TreeResponse, MAX_BATCH,
 };
 use budwood_core::{Changeset, ObjectId, RepoPath};
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -104,6 +104,26 @@ impl Remote {
     pub fn diff(&self, from: &str, to: &str, path: &RepoPath) -> Result<DiffResponse> {
         let req = self.http.get(self.url("diff")).query(&[("from", from), ("to", to), ("path", path.as_str())]);
         Ok(send(req)?.json()?)
+    }
+
+    /// For each line of the file at `path` as of `rev`, the changeset that
+    /// introduced it.
+    pub fn blame(&self, rev: &str, path: &RepoPath) -> Result<BlameResponse> {
+        let req = self.http.get(self.url("blame")).query(&[("rev", rev), ("path", path.as_str())]);
+        Ok(send(req)?.json()?)
+    }
+
+    /// Asks the server to commit the inverse of changeset `rev` on head
+    /// ("backout"). Fails with a conflict if later changesets touched the same
+    /// paths. `message` defaults to a `Revert "..."` message.
+    pub fn revert(&self, rev: &str, author: &str, message: Option<&str>) -> Result<CommitResponse> {
+        let body = RevertRequest { author: author.to_string(), message: message.map(str::to_string) };
+        let req = self.http.post(self.url(&format!("changesets/{rev}/revert"))).json(&body);
+        let resp: CommitResponse = send(req)?.json()?;
+        if !resp.changeset.verify() {
+            bail!("server returned changeset {} with a mismatched id", resp.changeset.seq);
+        }
+        Ok(resp)
     }
 
     pub fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {

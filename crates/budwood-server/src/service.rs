@@ -5,11 +5,14 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use budwood_core::api::{CommitRequest, CommitResponse, DiffResponse, ListEntry, Revision, TreeResponse, MAX_BATCH};
+use budwood_core::api::{
+    CommitRequest, CommitResponse, DiffResponse, ListEntry, RevertRequest, Revision, TreeResponse, MAX_BATCH,
+};
 use budwood_core::{
     apply_changes, diff_trees, empty_tree_id, lookup, validate_changes, Change, Changeset, EntryKind, ObjectId,
     RepoPath, TreeSink, TreeSource,
@@ -45,8 +48,10 @@ fn internal(e: budwood_core::Error) -> ServiceError {
 }
 
 pub struct Service {
-    objects: Arc<dyn ObjectStore>,
-    meta: MetaStore,
+    pub(crate) objects: Arc<dyn ObjectStore>,
+    pub(crate) meta: MetaStore,
+    /// Derived values computed (not served from the memo) since startup.
+    pub(crate) derivations: AtomicU64,
 }
 
 impl Service {
@@ -59,14 +64,20 @@ impl Service {
     }
 
     pub fn new(objects: Arc<dyn ObjectStore>, meta: MetaStore) -> anyhow::Result<Self> {
-        let service = Self { objects, meta };
+        let service = Self { objects, meta, derivations: AtomicU64::new(0) };
         // Clients fetch the empty tree like any other.
         Trees(&*service.objects).put_tree(&budwood_core::Tree::new())?;
         Ok(service)
     }
 
-    fn trees(&self) -> Trees<'_> {
+    pub(crate) fn trees(&self) -> Trees<'_> {
         Trees(&*self.objects)
+    }
+
+    /// How many derived values (see [`crate::derived`]) this service has
+    /// computed rather than read from the memo table.
+    pub fn derivations(&self) -> u64 {
+        self.derivations.load(Ordering::Relaxed)
     }
 
     pub fn create_repo(&self, name: &str) -> ServiceResult<bool> {
@@ -101,10 +112,13 @@ impl Service {
         if rev.is_empty() || rev == "head" {
             return self.head_revision(repo);
         }
-        if rev == "0" {
-            return Ok(Revision { seq: 0, id: None, root_tree: empty_tree_id() });
-        }
-        let found = if let Ok(seq) = rev.parse::<u64>() {
+        // Decimal digits only (`+5` is not a revision); a 64-digit string
+        // overflows u64 and is tried as a changeset id instead.
+        let seq = if rev.bytes().all(|b| b.is_ascii_digit()) { rev.parse::<u64>().ok() } else { None };
+        let found = if let Some(seq) = seq {
+            if seq == 0 {
+                return Ok(Revision { seq: 0, id: None, root_tree: empty_tree_id() });
+            }
             self.meta.by_seq(repo, seq)?
         } else if let Ok(id) = ObjectId::from_hex(rev) {
             self.meta.by_id(repo, &id)?
@@ -158,7 +172,7 @@ impl Service {
         Ok(DiffResponse { from, to, changes })
     }
 
-    fn load(&self, id: &ObjectId) -> ServiceResult<Vec<u8>> {
+    pub(crate) fn load(&self, id: &ObjectId) -> ServiceResult<Vec<u8>> {
         self.objects.get(id)?.ok_or_else(|| ServiceError::NotFound(format!("object {id} not found")))
     }
 
@@ -275,6 +289,29 @@ impl Service {
             }
         }
         Err(ServiceError::Unavailable("too many concurrent commits; retry".into()))
+    }
+
+    /// Commits the inverse of changeset `rev` on head: every path it changed
+    /// is restored to its state in `rev`'s parent (or deleted, if it wasn't a
+    /// file there). This goes through [`Service::commit`] with `base = rev`, so
+    /// it conflicts if any later changeset touched an overlapping path.
+    pub fn revert(&self, repo: &str, rev: &str, req: RevertRequest) -> ServiceResult<CommitResponse> {
+        let target = self.changeset(repo, rev)?;
+        let parent_root = match target.seq - 1 {
+            0 => empty_tree_id(),
+            parent => self.meta.root_tree_at(repo, parent)?.ok_or_else(|| {
+                ServiceError::Internal(anyhow::anyhow!("parent of changeset {} is missing", target.seq))
+            })?,
+        };
+        let mut changes = Vec::with_capacity(target.changes.len());
+        for change in &target.changes {
+            let before = lookup(&self.trees(), parent_root, &change.path).map_err(internal)?.and_then(|e| e.as_file());
+            changes.push(Change { path: change.path.clone(), new: before });
+        }
+        let message = req.message.unwrap_or_else(|| {
+            format!("Revert \"{}\"\n\nThis reverts revision {} ({}).", target.summary(), target.seq, target.id)
+        });
+        self.commit(repo, CommitRequest { base: target.seq, author: req.author, message, changes })
     }
 }
 
@@ -422,6 +459,109 @@ mod tests {
         assert_eq!(framed.len(), 32 + 8 + 3);
         assert_eq!(&framed[..32], state.blob.as_bytes());
         assert_eq!(&framed[40..], b"abc");
+    }
+
+    #[test]
+    fn revision_forms() {
+        let svc = service();
+        let one = upload(&svc, "1");
+        let cs = commit(&svc, 0, vec![Change::set(path("a"), one)]).unwrap().changeset;
+        for rev in ["0", "00", " 000 "] {
+            assert_eq!(svc.resolve("r", rev).unwrap().seq, 0, "{rev:?}");
+        }
+        assert!(matches!(svc.changeset("r", "00"), Err(ServiceError::NotFound(_))));
+        for rev in ["1", "01", "head", "", &cs.id.to_hex(), &cs.id.to_hex().to_uppercase()] {
+            assert_eq!(svc.resolve("r", rev).unwrap().id, Some(cs.id), "{rev:?}");
+        }
+        for rev in ["+1", "-1", "1.0", "abc", "18446744073709551616"] {
+            assert!(matches!(svc.resolve("r", rev), Err(ServiceError::BadRequest(_))), "{rev:?}");
+        }
+        // 64 decimal digits overflow u64, so they are read as a (missing) id.
+        assert!(matches!(svc.resolve("r", &"1".repeat(64)), Err(ServiceError::NotFound(_))));
+        assert!(matches!(svc.resolve("r", "2"), Err(ServiceError::NotFound(_))));
+    }
+
+    fn revert(svc: &Service, rev: &str, message: Option<&str>) -> ServiceResult<CommitResponse> {
+        svc.revert("r", rev, RevertRequest { author: "bot".into(), message: message.map(Into::into) })
+    }
+
+    #[test]
+    fn revert_restores_parent_state() {
+        let svc = service();
+        let (one, two, three) = (upload(&svc, "1"), upload(&svc, "2"), upload(&svc, "3"));
+        commit(&svc, 0, vec![Change::set(path("a"), one), Change::set(path("gone"), one)]).unwrap();
+        let target = commit(
+            &svc,
+            1,
+            vec![Change::set(path("a"), two), Change::delete(path("gone")), Change::set(path("new/file"), three)],
+        )
+        .unwrap()
+        .changeset;
+        commit(&svc, 2, vec![Change::set(path("unrelated"), one)]).unwrap();
+
+        let resp = revert(&svc, "2", None).unwrap();
+        let cs = resp.changeset;
+        assert!(resp.rebased && cs.verify());
+        assert_eq!((cs.seq, cs.base, cs.author.as_str()), (4, 2, "bot"));
+        assert_eq!(cs.message, format!("Revert \"m\"\n\nThis reverts revision 2 ({}).", target.id));
+        assert_eq!(
+            cs.changes,
+            vec![Change::set(path("a"), one), Change::set(path("gone"), one), Change::delete(path("new/file"))]
+        );
+        // The files are back to revision 1's state, and later changes are kept.
+        let diff = svc.diff("r", "1", "4", &RepoPath::root()).unwrap();
+        assert_eq!(diff.changes, vec![Change::set(path("unrelated"), one)]);
+
+        // Reverting the revert reapplies the change, with a custom message.
+        let again = revert(&svc, "head", Some("Reland")).unwrap().changeset;
+        assert_eq!(again.message, "Reland");
+        assert!(svc
+            .diff("r", "2", "5", &RepoPath::root())
+            .unwrap()
+            .changes
+            .iter()
+            .all(|c| c.path == path("unrelated")));
+    }
+
+    #[test]
+    fn revert_of_an_add_deletes_and_of_the_first_changeset_empties() {
+        let svc = service();
+        let one = upload(&svc, "1");
+        commit(&svc, 0, vec![Change::set(path("dir/a"), one)]).unwrap();
+        let cs = revert(&svc, "1", None).unwrap().changeset;
+        assert_eq!(cs.changes, vec![Change::delete(path("dir/a"))]);
+        assert_eq!((cs.seq, cs.base), (2, 1));
+        assert_eq!(svc.resolve("r", "head").unwrap().root_tree, empty_tree_id());
+    }
+
+    #[test]
+    fn revert_conflicts_with_later_changes() {
+        let svc = service();
+        let (one, two) = (upload(&svc, "1"), upload(&svc, "2"));
+        commit(&svc, 0, vec![Change::set(path("a/x"), one), Change::set(path("b"), one)]).unwrap();
+        commit(&svc, 1, vec![Change::set(path("a/x"), two)]).unwrap();
+        commit(&svc, 2, vec![Change::set(path("a/x"), one)]).unwrap();
+        match revert(&svc, "2", None) {
+            Err(ServiceError::Conflict { paths, message }) => {
+                assert_eq!(paths, vec![path("a/x")]);
+                assert!(message.contains("after revision 2"), "{message}");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // The newest change to a/x can be reverted.
+        let cs = revert(&svc, "3", None).unwrap().changeset;
+        assert_eq!(cs.changes, vec![Change::set(path("a/x"), two)]);
+
+        // A later change under a directory the target replaced also conflicts.
+        commit(&svc, 4, vec![Change::delete(path("a/x")), Change::set(path("a"), one)]).unwrap();
+        commit(&svc, 5, vec![Change::delete(path("a")), Change::set(path("a/y"), two)]).unwrap();
+        assert!(matches!(revert(&svc, "5", None), Err(ServiceError::Conflict { .. })));
+
+        assert!(matches!(revert(&svc, "0", None), Err(ServiceError::NotFound(_))));
+        assert!(matches!(revert(&svc, "99", None), Err(ServiceError::NotFound(_))));
+        assert!(matches!(revert(&svc, "1", Some("  ")), Err(ServiceError::BadRequest(_))));
+        let empty_author = svc.revert("r", "6", RevertRequest { author: " ".into(), message: None });
+        assert!(matches!(empty_author, Err(ServiceError::BadRequest(_))));
     }
 
     #[test]

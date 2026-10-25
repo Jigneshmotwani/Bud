@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ObjectId};
+use crate::{Error, ObjectId, METADATA_DIR};
 
 const TREE_MAGIC: &[u8; 4] = b"BWT1";
 
@@ -159,7 +159,7 @@ impl Tree {
             let len = reader.u32().ok_or_else(|| corrupt("truncated"))? as usize;
             let name = reader.take(len).ok_or_else(|| corrupt("truncated"))?;
             let name = std::str::from_utf8(name).map_err(|_| corrupt("name is not UTF-8"))?;
-            if name.is_empty() || name.contains(['/', '\0']) || name == "." || name == ".." {
+            if name.is_empty() || name.contains(['/', '\0']) || matches!(name, "." | ".." | METADATA_DIR) {
                 return Err(corrupt("invalid entry name"));
             }
             if previous.is_some_and(|prev| prev >= name) {
@@ -241,5 +241,22 @@ mod tests {
             bad.extend_from_slice(id.as_bytes());
         }
         assert!(Tree::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_names() {
+        for name in [".", "..", METADATA_DIR, "", "a/b", "nul\0"] {
+            let mut bytes = TREE_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.push(1);
+            bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(ObjectId::for_blob(b"x").as_bytes());
+            assert!(Tree::decode(&bytes).is_err(), "{name:?}");
+        }
+        // Only the exact name is reserved.
+        let mut tree = Tree::new();
+        tree.insert(".budignore", TreeEntry { kind: EntryKind::File, id: ObjectId::for_blob(b"x") });
+        assert_eq!(Tree::decode(&tree.encode()).unwrap(), tree);
     }
 }

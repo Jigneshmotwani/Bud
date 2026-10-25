@@ -61,6 +61,9 @@ enum Command {
         path: Option<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        /// Only changesets older than this sequence number (for paging).
+        #[arg(long, value_name = "SEQ")]
+        before: Option<u64>,
     },
     /// Show one changeset.
     Show { rev: String },
@@ -75,6 +78,28 @@ enum Command {
         path: Option<String>,
         #[arg(long, default_value = "head")]
         rev: String,
+    },
+    /// Show which changeset last changed each line of a file.
+    Blame {
+        path: String,
+        #[arg(long, default_value = "head")]
+        rev: String,
+    },
+    /// Commit, on the server, a changeset that undoes revision REV.
+    Backout {
+        rev: String,
+        /// Message for the new changeset (default: Revert "<summary>" ...).
+        #[arg(short, long)]
+        message: Option<String>,
+        #[arg(long, env = "BUD_AUTHOR")]
+        author: Option<String>,
+    },
+    /// List the files that differ between two revisions on the server.
+    RemoteDiff {
+        from: String,
+        #[arg(default_value = "head")]
+        to: String,
+        path: Option<String>,
     },
     /// Manage which paths are checked out.
     Sparse {
@@ -209,10 +234,10 @@ fn run(cli: Cli) -> Result<()> {
                 writeln!(out, "reverted {}", change.path)?;
             }
         }
-        Command::Log { path, limit } => {
+        Command::Log { path, limit, before } => {
             let ctx = ReadContext::new(&cli)?;
             let path = ctx.path(path.as_deref())?;
-            for cs in ctx.remote.log(&path, None, *limit)? {
+            for cs in ctx.remote.log(&path, *before, *limit)? {
                 writeln!(out, "{}", log_line(&cs))?;
             }
         }
@@ -254,6 +279,51 @@ fn run(cli: Cli) -> Result<()> {
                     EntryKind::File => "",
                 };
                 writeln!(out, "{}{suffix}", entry.name)?;
+            }
+        }
+        Command::Blame { path, rev } => {
+            let ctx = ReadContext::new(&cli)?;
+            let path = ctx.path(Some(path))?;
+            let blame = ctx.remote.blame(rev, &path)?;
+            let width = blame.lines.last().map_or(1, |l| l.line_no.to_string().len());
+            for line in &blame.lines {
+                writeln!(
+                    out,
+                    "{:>6} {} {:<12} {} {:>width$}| {}",
+                    line.seq,
+                    &line.id.to_hex()[..12],
+                    truncate(&line.author, 12),
+                    &format_time(line.timestamp)[..10],
+                    line.line_no,
+                    line.text
+                )?;
+            }
+        }
+        Command::Backout { rev, message, author } => {
+            let ctx = ReadContext::new(&cli)?;
+            let author = author
+                .clone()
+                .or_else(|| std::env::var("USER").ok())
+                .ok_or_else(|| anyhow!("set --author or BUD_AUTHOR"))?;
+            let resp = ctx.remote.revert(rev, &author, message.as_deref())?;
+            let cs = &resp.changeset;
+            writeln!(
+                out,
+                "committed revision {} ({}), backing out revision {}; {} file(s)",
+                cs.seq,
+                cs.id.short(),
+                cs.base,
+                cs.changes.len()
+            )?;
+            if ctx.workspace.is_some() {
+                writeln!(out, "run `bud sync` to update the working copy")?;
+            }
+        }
+        Command::RemoteDiff { from, to, path } => {
+            let ctx = ReadContext::new(&cli)?;
+            let path = ctx.path(path.as_deref())?;
+            for change in ctx.remote.diff(from, to, &path)?.changes {
+                writeln!(out, "{} {}", if change.new.is_some() { '+' } else { '-' }, change.path)?;
             }
         }
         Command::Sparse { command } => {
