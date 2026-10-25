@@ -106,69 +106,48 @@ fn list(paths: &[RepoPath]) -> String {
     paths.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
 }
 
-/// Another process holds the workspace lock, or a crashed one left it behind.
+/// Another process, or another handle in this one, holds the workspace lock.
 #[derive(Debug, thiserror::Error)]
-#[error("{}", self.message())]
+#[error("workspace is locked by another bud process{}; wait for it to finish", .pid.map(|p| format!(" (pid {p})")).unwrap_or_default())]
 pub struct WorkspaceLocked {
     /// The lock file.
     pub path: PathBuf,
-    /// The pid recorded in the lock file, if it could be read.
+    /// The holder's pid, if it could be read.
     pub pid: Option<u32>,
-    /// True if the holder is known to be no longer running.
-    pub stale: bool,
 }
 
-impl WorkspaceLocked {
-    fn message(&self) -> String {
-        let rm = format!("rm '{}'", self.path.display());
-        match (self.pid, self.stale) {
-            (Some(pid), true) => format!(
-                "workspace lock {} is stale: process {pid}, which held it, is no longer running (it probably crashed \
-                 or was interrupted). Remove it with `{rm}` and try again.",
-                self.path.display()
-            ),
-            (Some(pid), false) => format!(
-                "workspace is locked by another bud process (pid {pid}). Wait for it to finish; if no bud process is \
-                 running, remove the lock with `{rm}`."
-            ),
-            (None, _) => format!(
-                "workspace is locked ({} exists). If no other bud process is running, remove it with `{rm}`.",
-                self.path.display()
-            ),
-        }
-    }
-}
-
-/// The exclusive lock on a workspace's `.bud/` state, released on drop.
+/// The exclusive lock on a workspace's `.bud/` state: an OS file lock on
+/// `.bud/lock`. The OS releases it when the guard drops or the process exits,
+/// however it exits, so a killed `bud` never leaves a stale lock behind.
 #[derive(Debug)]
 pub struct WorkspaceLock {
     path: PathBuf,
-    token: String,
+    file: fs::File,
 }
 
 impl WorkspaceLock {
     fn acquire(meta_dir: &Path) -> Result<Self> {
         let path = meta_dir.join(LOCK_FILE);
-        // The pid, plus a nonce so that a guard never removes a lock that
-        // was taken over by someone else after being removed by hand.
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let token = format!("{} {nonce}\n", std::process::id());
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(token.as_bytes()) {
-                    let _ = fs::remove_file(&path);
-                    return Err(e).with_context(|| format!("writing {}", path.display()));
-                }
-                Ok(Self { path, token })
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                // Empty while the holder is still writing its pid.
+                let pid = fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok());
+                return Err(WorkspaceLocked { path, pid }.into());
             }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                // Empty while its creator is still writing it.
-                let pid = fs::read_to_string(&path).ok().and_then(|s| s.split_whitespace().next()?.parse().ok());
-                let stale = pid.is_some_and(|pid| process_alive(pid) == Some(false));
-                Err(WorkspaceLocked { path, pid, stale }.into())
-            }
-            Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
+            Err(fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", path.display())),
         }
+        // The pid is only informational, for the error message above.
+        file.set_len(0)?;
+        file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+        Ok(Self { path, file })
     }
 
     pub fn path(&self) -> &Path {
@@ -178,22 +157,9 @@ impl WorkspaceLock {
 
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
-        if fs::read_to_string(&self.path).is_ok_and(|s| s == self.token) {
-            let _ = fs::remove_file(&self.path);
-        }
+        // Closing the file releases the lock.
+        let _ = self.file.set_len(0);
     }
-}
-
-/// Whether process `pid` is running, if that can be told without libc.
-fn process_alive(pid: u32) -> Option<bool> {
-    if pid == std::process::id() {
-        return Some(true);
-    }
-    let proc = Path::new("/proc");
-    if cfg!(target_os = "linux") && proc.join("self").exists() {
-        return Some(proc.join(pid.to_string()).exists());
-    }
-    None
 }
 
 #[derive(Debug)]

@@ -106,6 +106,24 @@ enum Command {
         #[command(subcommand)]
         command: SparseCommand,
     },
+    /// Inspect or trim the local object cache.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Show how much the cache holds and its budget.
+    Usage,
+    /// Evict least recently used objects down to the budget (or --max-bytes).
+    Gc {
+        #[arg(long)]
+        max_bytes: Option<u64>,
+    },
+    /// Set the cache budget in bytes, or `default`.
+    SetBudget { bytes: String },
 }
 
 #[derive(Subcommand)]
@@ -326,6 +344,38 @@ fn run(cli: Cli) -> Result<()> {
                 writeln!(out, "{} {}", if change.new.is_some() { '+' } else { '-' }, change.path)?;
             }
         }
+        Command::Cache { command } => {
+            let (mut ws, _) = open_workspace()?;
+            match command {
+                CacheCommand::Usage => {
+                    let usage = ws.cache_usage()?;
+                    let budget = ws.config().cache_max_bytes();
+                    writeln!(out, "{} object(s), {} of {} budget", usage.objects, bytes(usage.bytes), bytes(budget))?;
+                }
+                CacheCommand::Gc { max_bytes } => {
+                    let gc = match max_bytes {
+                        Some(n) => ws.gc_cache_to(*n)?,
+                        None => ws.gc_cache()?,
+                    };
+                    writeln!(
+                        out,
+                        "freed {} object(s), {}; {} object(s), {} remain",
+                        gc.freed_objects,
+                        bytes(gc.freed_bytes),
+                        gc.remaining.objects,
+                        bytes(gc.remaining.bytes)
+                    )?;
+                }
+                CacheCommand::SetBudget { bytes: arg } => {
+                    let budget = match arg.as_str() {
+                        "default" => None,
+                        n => Some(n.parse::<u64>().map_err(|_| anyhow!("expected a byte count or `default`"))?),
+                    };
+                    ws.set_cache_max_bytes(budget)?;
+                    writeln!(out, "cache budget is {}", bytes(ws.config().cache_max_bytes()))?;
+                }
+            }
+        }
         Command::Sparse { command } => {
             let (mut ws, cwd) = open_workspace()?;
             match command {
@@ -356,6 +406,22 @@ fn log_line(cs: &Changeset) -> String {
     )
 }
 
+/// A byte count with a binary unit, e.g. `1.5 GiB`.
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -380,6 +446,13 @@ fn format_time(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_bytes() {
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(1536), "1.5 KiB");
+        assert_eq!(bytes(2 << 30), "2.0 GiB");
+    }
 
     #[test]
     fn formats_time() {

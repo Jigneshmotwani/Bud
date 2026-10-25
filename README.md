@@ -33,18 +33,19 @@ here are our own.
 | **Source control as an API** | Yes. Every operation is a [versioned HTTP/JSON API](docs/api.md). You can use `bud` without a working copy (`--server/--repo`), or call the API directly. |
 | **Cheap, lock-free commits** | Yes. Commits name the revision they were based on. The server rebases them over newer, non-overlapping history and appends with an optimistic compare-and-swap. There are no client-held locks and no merge queue. |
 | **Changesets as a write-ahead log** | Yes. Each changeset lists only the files that changed relative to its parent, each pointing at a content-addressed blob. |
-| **Derived data** | Partly. Root trees and a `path_history` index are derived from changesets and power path-filtered log and commit conflict checks. A blame index is on the roadmap. |
+| **Derived data** | Yes. Root trees and a `path_history` index are derived from changesets and power path-filtered log and commit conflict checks. A generic memoized derivation layer computes line **blame** incrementally: each file version is derived from that file's previous version plus a diff, so cost scales with the file's history, not the repository's. |
+| **Programmatic repairs** | Yes. `POST changesets/{rev}/revert` (`bud backout`) creates the inverse changeset on the server, for automated revert pipelines. |
 | **Content-addressed fetching instead of packfiles** | Yes. Objects are fetched individually or in framed batches by BLAKE3 id, and the client verifies every one. Immutable object responses carry `Cache-Control: immutable`. |
 | **Optional sparse working copies** | Yes. `bud clone --sparse PATH` and `bud sparse add PATH`. |
 | **Horizontal scalability, no full copy anywhere** | Partly. No client holds a full copy. The server is currently a single node (SQLite plus a filesystem object store) behind pluggable storage traits. |
-| **Tiered architecture** (per-node daemon, regional caches, authoritative servers) | In progress. A regional read-through cache (`budwood-cache`) is being built. A per-node daemon is on the roadmap. |
+| **Tiered architecture** (per-node daemon, regional caches, authoritative servers) | Partly. `budwood-cache` is a verified, chainable read-through cache tier with request coalescing. Each workspace keeps a size-bounded LRU object cache. A per-node daemon is on the roadmap. |
 | **Post-merge testing instead of a global merge queue** | Design stance. Budwood lands non-conflicting changes immediately instead of serializing them through a queue. Test-integration hooks are not built yet. |
 
 Read [docs/architecture.md](docs/architecture.md) for how these fit together.
 
 ## Quick start
 
-You need a stable Rust toolchain (1.80 or newer).
+You need a stable Rust toolchain (1.89 or newer).
 
 ```sh
 git clone <this repository> budwood && cd budwood
@@ -133,12 +134,22 @@ and the read-only commands. Workspace commands use the server and repository rec
 | `bud commit -m MSG [--author NAME] [PATH]...` | Upload and commit all local changes, or only those under `PATH`s. The author defaults to `$BUD_AUTHOR`, then `$USER`. |
 | `bud sync [--rev REV]` | Update the working copy to head (or `REV`), keeping local changes that don't collide with incoming ones. |
 | `bud revert PATH...` | Discard local changes at or under `PATH`s. |
-| `bud log [PATH] [-n N]` | Show history, newest first, optionally only changesets that touched `PATH` or anything under it (default `-n 20`). |
+| `bud log [PATH] [-n N] [--before SEQ]` | Show history, newest first, optionally only changesets that touched `PATH` or anything under it (default `-n 20`). |
 | `bud show REV` | Show one changeset: author, date, message, changed files, and whether the server rebased it. |
 | `bud cat PATH [--rev REV]` | Print a file at a revision (default `head`). |
 | `bud ls [PATH] [--rev REV]` | List a directory at a revision. Suffixes: `/` directory, `*` executable, `@` symlink. |
+| `bud blame PATH [--rev REV]` | Show, for each line, the changeset that introduced it. Computed by the server. |
+| `bud backout REV [-m MSG] [--author NAME]` | Have the server commit a changeset that undoes `REV`. Rejected if later changesets touched the same paths. |
+| `bud remote-diff FROM [TO] [PATH]` | List the files that differ between two revisions (`TO` defaults to `head`), computed by the server. |
 | `bud sparse add PATH` | Add `PATH` to the checked-out set and materialize its files. |
 | `bud sparse list` | List the checked-out paths. |
+| `bud cache usage` | Show the size of the workspace's object cache and its budget. |
+| `bud cache gc [--max-bytes N]` | Evict least recently used objects down to the budget (or `N`). Evicted objects are re-fetched on demand. |
+| `bud cache set-budget BYTES\|default` | Set the cache budget (default 2 GiB). |
+
+Mutating commands take an OS file lock on `.bud/lock`, so concurrent `bud` processes in one working copy are refused
+instead of corrupting it. The OS releases the lock when a process exits, so an interrupted `bud` never leaves a stale
+lock.
 
 Inside a workspace, `PATH` arguments are relative to the current directory. With `--server/--repo` they are
 repository paths. `REV` is `head`, a sequence number (`0` is the empty repository), or a full 64-character changeset
@@ -158,6 +169,32 @@ ignored.
 
 Logging uses `RUST_LOG` (default `budwood_server=info`).
 
+### `budwood-cache`
+
+A read-through cache to run close to clients. Point `bud clone` (or another cache) at it instead of the server.
+
+```sh
+budwood-cache --upstream http://127.0.0.1:7171 --listen 127.0.0.1:7272 --cache-dir ./cache --max-cache-bytes 50G
+bud clone http://127.0.0.1:7272 demo
+curl http://127.0.0.1:7272/v1/cache/stats
+```
+
+Objects are verified against their ids before they are cached, concurrent misses for one object are coalesced into a
+single upstream fetch, and everything that isn't an immutable object is proxied unchanged. Cache hits are not yet
+authorized against the upstream; see the roadmap.
+
+### `budwood-import`
+
+Imports a git repository's first-parent history, one changeset per git commit. Imports are resumable: rerun the same
+command to pick up new commits.
+
+```sh
+budwood-import ~/src/some-repo main --server http://127.0.0.1:7171 --repo some-repo --create-repo --verify
+```
+
+Each changeset's message keeps the git message plus `Git-Commit:` and `Git-Date:` trailers. Submodules (gitlinks)
+are skipped. `--verify` checks that the imported tree matches git.
+
 ## Project layout
 
 ```text
@@ -171,15 +208,18 @@ crates/
     src/api.rs        JSON request/response types for HTTP API v1
   budwood-server/   authoritative server (`budwood-server` binary)
     src/http.rs       axum routes for API v1
-    src/service.rs    repository operations: resolve, log, tree, diff, commit
+    src/service.rs    repository operations: resolve, log, tree, diff, commit, revert
     src/meta.rs       SQLite changeset log and path_history index
+    src/derived.rs    generic memoized derived-data layer
+    src/blame.rs      incremental line blame built on derived.rs
     src/store.rs      content-addressed object store (filesystem, in-memory)
   budwood-client/   client library and the `bud` CLI
     src/remote.rs     blocking HTTP client for API v1
-    src/objects.rs    verified local object cache with lazy and batched fetch
-    src/workspace.rs  sparse working copy: status, commit, sync, revert, diff
+    src/objects.rs    verified, size-bounded LRU object cache with lazy and batched fetch
+    src/workspace.rs  sparse working copy: status, commit, sync, revert, diff, locking
     src/ignore.rs     .budignore patterns
-  budwood-cache/    regional read-through object cache (in progress)
+  budwood-cache/    regional read-through object cache tier
+  budwood-import/   resumable git history importer
 docs/
   architecture.md   data model, protocols and design tradeoffs
   api.md            HTTP API v1 reference
@@ -189,23 +229,22 @@ docs/
 
 These are not implemented yet, roughly in priority order:
 
-- **Regional read-through cache tier** (`budwood-cache`, in progress): serve immutable objects close to clients,
-  verify them, and chain tiers in front of the authoritative server.
-- **Per-node daemon and virtual filesystem**: share one object cache between all workspaces on a machine, and
-  materialize files on first access instead of at checkout.
-- **Blame index** and other derived data computed asynchronously from the changeset log.
-- **Authentication, authorization and per-directory permissions**, enforced by the server and respected by caches.
+- **Per-node daemon and virtual filesystem**: share one object cache between all workspaces on a machine, watch the
+  filesystem instead of scanning it, and materialize files on first access instead of at checkout.
+- **Authentication, authorization and per-directory permissions**, enforced by the server and respected by caches
+  (today `budwood-cache` serves hits without asking upstream).
+- **Eager derived data**: warm blame and other derivations in the background after each commit.
 - **Pluggable cloud backends** for metadata (the changeset log) and objects, so the server tier can scale out
   horizontally.
 - **Streaming large blobs** instead of buffering whole objects in memory, plus chunked uploads.
 - **Batched and pipelined tree fetching**, so checkouts of large trees need fewer round trips.
-- **Garbage collection** of unreferenced objects.
-- **git import/export bridge.**
+- **Garbage collection** of unreferenced server objects (for example trees written by commit attempts that lost the
+  append race).
+- **git export**, to complement `budwood-import`.
 - **Code review integration.**
-- **Workspace locking**, so concurrent `bud` processes in one working copy are safe.
 - **Post-merge testing hooks** that report on landed changesets.
 - **Windows support**: executable bits and symlinks are not handled today.
-- Smaller items: `bud sparse remove`, short changeset ids, `bud log --before`, remote diff from the CLI.
+- Smaller items: `bud sparse remove`, short changeset ids, JSON output for scripting.
 
 ## Contributing
 

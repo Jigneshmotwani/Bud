@@ -118,7 +118,7 @@ fn carry_over(old: &[&str], old_origins: &[u64], new: &[&str], seq: u64) -> Vec<
             DiffOp::Equal { old_index, len, .. } => out.extend_from_slice(&old_origins[old_index..old_index + len]),
             DiffOp::Delete { .. } => {}
             DiffOp::Insert { new_len, .. } | DiffOp::Replace { new_len, .. } => {
-                out.extend(std::iter::repeat(seq).take(new_len))
+                out.extend(std::iter::repeat_n(seq, new_len))
             }
         }
     }
@@ -155,7 +155,7 @@ fn compress(origins: &[u64]) -> Vec<(u64, u32)> {
 }
 
 fn expand(runs: &[(u64, u32)]) -> Vec<u64> {
-    runs.iter().flat_map(|&(seq, count)| std::iter::repeat(seq).take(count as usize)).collect()
+    runs.iter().flat_map(|&(seq, count)| std::iter::repeat_n(seq, count as usize)).collect()
 }
 
 impl Service {

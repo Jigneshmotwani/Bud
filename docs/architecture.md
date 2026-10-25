@@ -340,9 +340,11 @@ A workspace is a directory containing `.bud/`:
 
 ```text
 .bud/
-  config.json   { "server": "http://…", "repo": "demo", "sparse": ["docs", "src"] }
+  config.json   { "server": "http://…", "repo": "demo", "sparse": ["docs", "src"], "cache_max_bytes": … }
   state.json    { "base": 7, "base_root": "<tree id>", "files": { "<path>": IndexEntry, … } }
   objects/      verified object cache: objects/ab/cdef… (blobs and trees, by id)
+  objects/usage approximate cache size, so budget checks don't need a scan
+  lock          OS file lock held by mutating commands; contains the holder's pid
 ```
 
 - `sparse` holds the checked-out prefixes. They are normalized to be sorted, deduplicated and non-overlapping, and
@@ -351,8 +353,15 @@ A workspace is a directory containing `.bud/`:
   ```json
   "src/main.rs": { "state": { "kind": "file", "blob": "983e…" }, "size": 29, "mtime_ns": 1792906746123456789 }
   ```
-- JSON files are written to a temporary file and renamed into place. The object cache is append-only and has no
-  size bound or eviction in v0.1.
+- JSON files are written to a temporary file and renamed into place.
+- The object cache is **bounded** (`cache_max_bytes`, default 2 GiB). Recency is the file mtime, refreshed on a hit
+  at most once a minute. When the size estimate in `objects/usage` exceeds the budget, the cache is scanned and the
+  least recently used objects are evicted down to 80% of the budget. Eviction only runs at safe points (after each
+  checkout batch of 1024 files, and at the end of an operation), never between fetching an object and using it.
+  Every read falls back to the server, so evicted objects are re-fetched transparently.
+- Mutating operations (`status`, `diff`, `commit`, `sync`, `revert`, `sparse add`, cache changes) hold an exclusive
+  OS file lock (`File::try_lock`) on `.bud/lock`. A second process gets a `WorkspaceLocked` error naming the
+  holder's pid. Because the OS drops the lock when the holder exits, a killed `bud` never leaves a stale lock.
 
 Only paths inside the sparse set exist in the index or on disk. Files on disk outside the sparse set are ignored.
 

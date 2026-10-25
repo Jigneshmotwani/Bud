@@ -28,20 +28,19 @@ fn concurrent_operations_on_one_workspace_are_refused() {
     let lock_path = root.join(".bud/lock");
     write(&root, "a.txt", "a\n");
     ws.commit("a", "alice", &[]).unwrap();
-    assert!(!lock_path.exists(), "released after each operation");
+    assert_lock_free(&root);
 
     // Another handle (standing in for another process) holds the lock.
     let other = Workspace::open(&root).unwrap();
     let guard = other.lock().unwrap();
     assert_eq!(guard.path(), lock_path);
     let pid = fs::read_to_string(&lock_path).unwrap();
-    assert!(pid.starts_with(&format!("{} ", std::process::id())), "{pid}");
+    assert_eq!(pid, format!("{}\n", std::process::id()));
 
     write(&root, "a.txt", "changed\n");
     let err = locked_error(ws.status().unwrap_err());
-    assert_eq!((err.pid, err.stale, err.path.as_path()), (Some(std::process::id()), false, lock_path.as_path()));
-    let msg = err.to_string();
-    assert!(msg.contains("locked by another bud process") && msg.contains(&format!("rm '{}'", lock_path.display())));
+    assert_eq!((err.pid, err.path.as_path()), (Some(std::process::id()), lock_path.as_path()));
+    assert!(err.to_string().contains("locked by another bud process"), "{err}");
     locked_error(ws.commit("c", "alice", &[]).unwrap_err());
     locked_error(ws.sync(None).unwrap_err());
     locked_error(ws.revert(&[path("a.txt")]).unwrap_err());
@@ -50,7 +49,7 @@ fn concurrent_operations_on_one_workspace_are_refused() {
     assert_eq!(read(&root, "a.txt"), "changed\n", "a refused revert changes nothing");
 
     drop(guard);
-    assert!(!lock_path.exists());
+    assert_lock_free(&root);
     assert_eq!(status(&mut ws), ["M a.txt"]);
 
     // Many handles racing: each operation either runs or is refused cleanly,
@@ -68,44 +67,45 @@ fn concurrent_operations_on_one_workspace_are_refused() {
             });
         }
     });
-    assert!(!lock_path.exists());
+    assert_lock_free(&root);
     let mut reopened = Workspace::open(&root).unwrap();
     assert_eq!(status(&mut reopened), ["M a.txt"]);
 }
 
+fn assert_lock_free(root: &Path) {
+    drop(Workspace::open(root).unwrap().lock().expect("lock should be free"));
+}
+
 #[test]
-fn stale_lock_is_reported_with_how_to_remove_it() {
+#[cfg(target_os = "linux")]
+fn lock_left_by_a_killed_process_does_not_block() {
     let server = TestServer::with_repo(REPO);
     let tmp = tempfile::tempdir().unwrap();
     let mut ws = clone(&server, REPO, &tmp.path().join("one"));
-    let lock_path = ws.root().join(".bud/lock");
+    let root = ws.root().to_path_buf();
+    let lock_path = root.join(".bud/lock");
 
-    // A process that has exited, as if bud had been killed mid-operation.
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap()).arg("--list").spawn().unwrap();
-    let dead = child.id();
-    child.wait().unwrap();
-    fs::write(&lock_path, format!("{dead} 12345\n")).unwrap();
-
-    let err = locked_error(ws.status().unwrap_err());
-    assert_eq!(err.pid, Some(dead));
-    let msg = err.to_string();
-    assert!(msg.contains(&format!("rm '{}'", lock_path.display())), "{msg}");
-    if cfg!(target_os = "linux") {
-        assert!(err.stale);
-        assert!(msg.contains("is stale") && msg.contains(&format!("process {dead}")), "{msg}");
+    // A child process takes the OS lock on the file and is killed while
+    // holding it, as if bud had been interrupted mid-operation.
+    // `exec` keeps the locked descriptor in the process we kill.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", r#"exec 9>>"$0" && flock 9 && exec sleep 60"#])
+        .arg(&lock_path)
+        .spawn()
+        .expect("sh and flock(1)");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Workspace::open(&root).unwrap().lock().is_ok() {
+        assert!(std::time::Instant::now() < deadline, "child never took the lock");
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // The CLI prints errors with `{:#}`; the lock message is the whole story.
-    assert_eq!(format!("{:#}", ws.status().unwrap_err()), msg);
-    assert!(lock_path.exists(), "never removed automatically");
+    locked_error(ws.status().unwrap_err());
+    child.kill().unwrap();
+    child.wait().unwrap();
 
-    // Unreadable contents still produce a helpful error.
-    fs::write(&lock_path, "").unwrap();
-    let err = locked_error(ws.status().unwrap_err());
-    assert_eq!((err.pid, err.stale), (None, false));
-    assert!(err.to_string().contains("rm '"), "{err}");
-
-    fs::remove_file(&lock_path).unwrap();
+    // Leftover contents naming a dead pid don't matter either.
+    fs::write(&lock_path, "4194303\n").unwrap();
     assert!(status(&mut ws).is_empty());
+    assert!(lock_path.exists(), "the lock file itself is permanent");
 }
 
 #[test]
