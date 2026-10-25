@@ -236,6 +236,38 @@ fn sparse_clone_and_sparse_add() {
 
 #[cfg(unix)]
 #[test]
+fn diff_shows_kind_changes() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let server = TestServer::with_repo(REPO);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ws = clone(&server, REPO, &tmp.path().join("one"));
+    let root = ws.root().to_path_buf();
+    write(&root, "run.sh", "#!/bin/sh\n");
+    write(&root, "tool", "old\n");
+    write(&root, "target", "same bytes");
+    ws.commit("base", "alice", &[]).unwrap();
+
+    // Kind only: the header and the kind lines, no hunks.
+    fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(ws.diff(&[path("run.sh")]).unwrap(), "diff run.sh\nold kind: file\nnew kind: executable\n");
+
+    // Kind and content: the kind lines, then the hunks.
+    write(&root, "tool", "new\n");
+    fs::set_permissions(root.join("tool"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        ws.diff(&[path("tool")]).unwrap(),
+        "diff tool\nold kind: file\nnew kind: executable\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+new\n"
+    );
+
+    // A file replaced by a symlink whose target equals the old content.
+    fs::remove_file(root.join("target")).unwrap();
+    symlink("same bytes", root.join("target")).unwrap();
+    assert_eq!(ws.diff(&[path("target")]).unwrap(), "diff target\nold kind: file\nnew kind: symlink\n");
+}
+
+#[cfg(unix)]
+#[test]
 fn executable_bit_and_symlinks_round_trip() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 

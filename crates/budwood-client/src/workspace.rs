@@ -3,22 +3,26 @@
 //! A workspace materializes only the paths in its sparse set. Its metadata
 //! lives in `.bud/`: `config.json` (server, repo, sparse paths), `state.json`
 //! (the base revision and an index of the files checked out from it) and an
-//! object cache. The index stores each file's size and mtime so `status` only
-//! re-hashes files whose metadata changed.
+//! bounded object cache. The index stores each file's size and mtime so
+//! `status` only re-hashes files whose metadata changed.
+//!
+//! Operations that change `.bud/` state (status, diff, commit, sync, revert,
+//! sparse add, cache gc) hold an exclusive lock file, `.bud/lock`, so that
+//! concurrent `bud` processes can't corrupt it.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use budwood_core::api::{CommitRequest, Revision};
-use budwood_core::{diff_trees, walk_files, Change, Changeset, FileState, ObjectId, RepoPath, METADATA_DIR};
+use budwood_core::{diff_trees, walk_files, Change, Changeset, FileKind, FileState, ObjectId, RepoPath, METADATA_DIR};
 use serde::{Deserialize, Serialize};
 
 use crate::ignore::Ignore;
-use crate::objects::Objects;
+use crate::objects::{CacheGc, CacheUsage, Objects, DEFAULT_CACHE_MAX_BYTES};
 use crate::remote::{ApiError, Remote};
 
 /// Files modified more recently than this are re-hashed on every `status`
@@ -26,12 +30,29 @@ use crate::remote::{ApiError, Remote};
 /// timestamp granularity would otherwise go unnoticed.
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
+/// Checkouts fetch and write files in batches of this many, and may evict
+/// cached objects between batches, so a checkout larger than the cache budget
+/// doesn't need twice its size on disk.
+const CHECKOUT_BATCH: usize = budwood_core::api::MAX_BATCH;
+
+const LOCK_FILE: &str = "lock";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub server: String,
     pub repo: String,
     /// Checked-out prefixes; `[""]` is the whole repository. Never overlapping.
     pub sparse: Vec<RepoPath>,
+    /// Size budget for the object cache in `.bud/objects`; default 2 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_max_bytes: Option<u64>,
+}
+
+impl Config {
+    /// The effective object cache budget.
+    pub fn cache_max_bytes(&self) -> u64 {
+        self.cache_max_bytes.unwrap_or(DEFAULT_CACHE_MAX_BYTES)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +106,96 @@ fn list(paths: &[RepoPath]) -> String {
     paths.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
 }
 
+/// Another process holds the workspace lock, or a crashed one left it behind.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", self.message())]
+pub struct WorkspaceLocked {
+    /// The lock file.
+    pub path: PathBuf,
+    /// The pid recorded in the lock file, if it could be read.
+    pub pid: Option<u32>,
+    /// True if the holder is known to be no longer running.
+    pub stale: bool,
+}
+
+impl WorkspaceLocked {
+    fn message(&self) -> String {
+        let rm = format!("rm '{}'", self.path.display());
+        match (self.pid, self.stale) {
+            (Some(pid), true) => format!(
+                "workspace lock {} is stale: process {pid}, which held it, is no longer running (it probably crashed \
+                 or was interrupted). Remove it with `{rm}` and try again.",
+                self.path.display()
+            ),
+            (Some(pid), false) => format!(
+                "workspace is locked by another bud process (pid {pid}). Wait for it to finish; if no bud process is \
+                 running, remove the lock with `{rm}`."
+            ),
+            (None, _) => format!(
+                "workspace is locked ({} exists). If no other bud process is running, remove it with `{rm}`.",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+/// The exclusive lock on a workspace's `.bud/` state, released on drop.
+#[derive(Debug)]
+pub struct WorkspaceLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl WorkspaceLock {
+    fn acquire(meta_dir: &Path) -> Result<Self> {
+        let path = meta_dir.join(LOCK_FILE);
+        // The pid, plus a nonce so that a guard never removes a lock that
+        // was taken over by someone else after being removed by hand.
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let token = format!("{} {nonce}\n", std::process::id());
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(token.as_bytes()) {
+                    let _ = fs::remove_file(&path);
+                    return Err(e).with_context(|| format!("writing {}", path.display()));
+                }
+                Ok(Self { path, token })
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                // Empty while its creator is still writing it.
+                let pid = fs::read_to_string(&path).ok().and_then(|s| s.split_whitespace().next()?.parse().ok());
+                let stale = pid.is_some_and(|pid| process_alive(pid) == Some(false));
+                Err(WorkspaceLocked { path, pid, stale }.into())
+            }
+            Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        if fs::read_to_string(&self.path).is_ok_and(|s| s == self.token) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Whether process `pid` is running, if that can be told without libc.
+fn process_alive(pid: u32) -> Option<bool> {
+    if pid == std::process::id() {
+        return Some(true);
+    }
+    let proc = Path::new("/proc");
+    if cfg!(target_os = "linux") && proc.join("self").exists() {
+        return Some(proc.join(pid.to_string()).exists());
+    }
+    None
+}
+
 #[derive(Debug)]
 pub struct CommitOutcome {
     pub changeset: Changeset,
@@ -111,25 +222,52 @@ pub struct Workspace {
 impl Workspace {
     /// Creates a working copy of `repo` in `dir`, checking out only `sparse`
     /// (or everything, if empty).
+    ///
+    /// `config.json` is written last, so a half-finished clone is never
+    /// mistaken for a workspace. If the checkout fails, everything the clone
+    /// created is removed again, so it can simply be retried.
     pub fn clone(server: &str, repo: &str, dir: &Path, sparse: Vec<RepoPath>) -> Result<Self> {
         if dir.exists() && fs::read_dir(dir)?.next().is_some() {
+            let meta = dir.join(METADATA_DIR);
+            if meta.is_dir() && !meta.join("config.json").is_file() {
+                bail!("{} contains an interrupted clone; remove it and clone again", dir.display());
+            }
             bail!("{} already exists and is not empty", dir.display());
         }
         let remote = Remote::new(server, repo)?;
         let head = remote.head().with_context(|| format!("contacting {server}"))?;
-        fs::create_dir_all(dir.join(METADATA_DIR))?;
-        let root = dir.canonicalize()?;
-        let config =
-            Config { server: remote.server().to_string(), repo: repo.to_string(), sparse: normalize_sparse(sparse) };
-        let objects = Objects::new(remote, root.join(METADATA_DIR).join("objects"))?;
-        let state = State { base: head.seq, base_root: head.root_tree, files: BTreeMap::new() };
-        let mut ws = Self { ignore: Ignore::load(&root)?, root, config, state, objects };
-        for prefix in ws.config.sparse.clone() {
-            ws.materialize(&prefix)?;
-        }
-        ws.save_config()?;
-        ws.save_state()?;
-        Ok(ws)
+        // The topmost directory this clone creates, if `dir` doesn't exist.
+        let created =
+            dir.ancestors().take_while(|a| !a.as_os_str().is_empty() && !a.exists()).last().map(Path::to_path_buf);
+        let result = (|| {
+            fs::create_dir_all(dir.join(METADATA_DIR))?;
+            let root = dir.canonicalize()?;
+            let config = Config {
+                server: remote.server().to_string(),
+                repo: repo.to_string(),
+                sparse: normalize_sparse(sparse),
+                cache_max_bytes: None,
+            };
+            let mut objects = Objects::new(remote, root.join(METADATA_DIR).join("objects"))?;
+            objects.set_max_bytes(config.cache_max_bytes());
+            let state = State { base: head.seq, base_root: head.root_tree, files: BTreeMap::new() };
+            let mut ws = Self { ignore: Ignore::load(&root)?, root, config, state, objects };
+            ws.locked(|ws| {
+                for prefix in ws.config.sparse.clone() {
+                    ws.materialize(&prefix)?;
+                }
+                ws.save_state()?;
+                ws.save_config()
+            })?;
+            Ok(ws)
+        })();
+        result.map_err(|e: anyhow::Error| match remove_partial_clone(dir, created.as_deref()) {
+            Ok(()) => e.context(format!("clone failed (removed the partial checkout in {})", dir.display())),
+            Err(cleanup) => e.context(format!(
+                "clone failed, and removing the partial checkout also failed ({cleanup}); remove {} before retrying",
+                dir.display()
+            )),
+        })
     }
 
     /// Opens the workspace containing `start`.
@@ -144,8 +282,58 @@ impl Workspace {
         let config: Config = read_json(&meta.join("config.json"))?;
         let state: State = read_json(&meta.join("state.json"))?;
         let remote = Remote::new(&config.server, &config.repo)?;
-        let objects = Objects::new(remote, meta.join("objects"))?;
+        let mut objects = Objects::new(remote, meta.join("objects"))?;
+        objects.set_max_bytes(config.cache_max_bytes());
         Ok(Self { ignore: Ignore::load(&root)?, root, config, state, objects })
+    }
+
+    /// Takes the exclusive workspace lock. Mutating operations take it
+    /// themselves, so holding it makes them fail with [`WorkspaceLocked`].
+    pub fn lock(&self) -> Result<WorkspaceLock> {
+        WorkspaceLock::acquire(&self.root.join(METADATA_DIR))
+    }
+
+    /// Runs `op` under the workspace lock, then enforces the cache budget.
+    fn locked<T>(&mut self, op: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let _lock = self.lock()?;
+        let result = op(self);
+        self.trim_cache();
+        result
+    }
+
+    /// Best effort: anything evicted is fetched again when it is needed.
+    fn trim_cache(&self) {
+        let _ = self.objects.trim();
+    }
+
+    /// The exact size of the local object cache.
+    pub fn cache_usage(&self) -> Result<CacheUsage> {
+        self.objects.cache_usage()
+    }
+
+    /// Evicts least recently used objects from the cache if it is over its
+    /// budget (down to 80% of it), and reports what was freed. Evicted objects
+    /// are fetched from the server again when they are next needed.
+    pub fn gc_cache(&mut self) -> Result<CacheGc> {
+        let _lock = self.lock()?;
+        self.objects.gc()
+    }
+
+    /// Evicts least recently used objects until the cache holds at most
+    /// `max_bytes` (0 empties it), regardless of the budget.
+    pub fn gc_cache_to(&mut self, max_bytes: u64) -> Result<CacheGc> {
+        let _lock = self.lock()?;
+        self.objects.gc_to(max_bytes)
+    }
+
+    /// Sets (or, with `None`, resets to the default) the cache budget and
+    /// saves it in `config.json`. It is enforced the next time an operation
+    /// adds to the cache, or by [`Workspace::gc_cache`].
+    pub fn set_cache_max_bytes(&mut self, max_bytes: Option<u64>) -> Result<()> {
+        let _lock = self.lock()?;
+        self.config.cache_max_bytes = max_bytes;
+        self.objects.set_max_bytes(self.config.cache_max_bytes());
+        self.save_config()
     }
 
     pub fn root(&self) -> &Path {
@@ -166,14 +354,37 @@ impl Workspace {
     }
 
     /// Converts a filesystem path (absolute, or relative to `cwd`) to a repo path.
+    ///
+    /// `..` is resolved lexically. The workspace root is canonical, so when
+    /// the path doesn't start with it literally (it goes through a symlink,
+    /// e.g. `/tmp` -> `/private/tmp` on macOS), the first ancestor that is
+    /// physically the root marks where the repository path begins; the rest
+    /// is taken literally, so a tracked symlink names itself, not its target.
+    /// An argument naming the workspace root is the root path.
     pub fn repo_path(&self, cwd: &Path, arg: &str) -> Result<RepoPath> {
         let joined = normalize_lexically(&cwd.join(arg));
-        let relative = joined.strip_prefix(&self.root).map_err(|_| anyhow!("{arg} is outside the workspace"))?;
+        let relative = match joined.strip_prefix(&self.root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => self.physical_relative(&joined).ok_or_else(|| anyhow!("{arg} is outside the workspace"))?,
+        };
         let text = relative
             .to_str()
             .ok_or_else(|| anyhow!("{arg} is not valid UTF-8"))?
             .replace(std::path::MAIN_SEPARATOR, "/");
         Ok(RepoPath::new(text)?)
+    }
+
+    /// `path` relative to the root, resolving symlinks only up to the point
+    /// where the path enters the workspace: the shortest ancestor whose
+    /// canonical form is the root or inside it (a symlink from outside may
+    /// point into a subdirectory). The rest of the path is taken literally.
+    fn physical_relative(&self, path: &Path) -> Option<PathBuf> {
+        let mut ancestors: Vec<&Path> = path.ancestors().collect();
+        ancestors.reverse();
+        ancestors.into_iter().find_map(|ancestor| {
+            let real = ancestor.canonicalize().ok()?;
+            Some(real.strip_prefix(&self.root).ok()?.join(path.strip_prefix(ancestor).ok()?))
+        })
     }
 
     fn fs_path(&self, path: &RepoPath) -> PathBuf {
@@ -188,8 +399,13 @@ impl Workspace {
 
     /// Differences between the files on disk and the base revision.
     ///
-    /// Takes `&mut self` because it refreshes stale stat data in the index.
+    /// Takes `&mut self` (and the workspace lock) because it refreshes stale
+    /// stat data in the index.
     pub fn status(&mut self) -> Result<Vec<LocalChange>> {
+        self.locked(Self::status_unlocked)
+    }
+
+    fn status_unlocked(&mut self) -> Result<Vec<LocalChange>> {
         // `.budignore` may have been checked out, synced or edited since open.
         self.ignore = Ignore::load(&self.root)?;
         let mut disk = Vec::new();
@@ -291,7 +507,11 @@ impl Workspace {
     /// them to the log. The server rebases them over newer changesets that
     /// touched other paths; the working copy is then updated to match.
     pub fn commit(&mut self, message: &str, author: &str, only: &[RepoPath]) -> Result<CommitOutcome> {
-        let mut changes = self.status()?;
+        self.locked(|ws| ws.commit_unlocked(message, author, only))
+    }
+
+    fn commit_unlocked(&mut self, message: &str, author: &str, only: &[RepoPath]) -> Result<CommitOutcome> {
+        let mut changes = self.status_unlocked()?;
         if !only.is_empty() {
             changes.retain(|c| only.iter().any(|p| c.path.is_within(p)));
         }
@@ -347,8 +567,10 @@ impl Workspace {
     /// Updates the working copy to `rev` (default: head), keeping local changes
     /// that don't collide with incoming ones.
     pub fn sync(&mut self, rev: Option<&str>) -> Result<SyncOutcome> {
-        let target = self.remote().resolve(rev.unwrap_or("head"))?;
-        self.update_to(target)
+        self.locked(|ws| {
+            let target = ws.remote().resolve(rev.unwrap_or("head"))?;
+            ws.update_to(target)
+        })
     }
 
     fn update_to(&mut self, target: Revision) -> Result<SyncOutcome> {
@@ -358,7 +580,7 @@ impl Workspace {
             incoming.extend(diff_trees(&self.objects, self.state.base_root, target.root_tree, prefix)?);
         }
         let local: BTreeMap<RepoPath, Option<FileState>> =
-            self.status()?.into_iter().map(|c| (c.path, c.new)).collect();
+            self.status_unlocked()?.into_iter().map(|c| (c.path, c.new)).collect();
 
         let mut conflicts = Vec::new();
         for change in &incoming {
@@ -384,7 +606,6 @@ impl Workspace {
             return Err(UpdateConflict { paths: conflicts }.into());
         }
 
-        self.objects.prefetch_blobs(incoming.iter().filter_map(|c| c.new.map(|s| s.blob)))?;
         let mut updated = 0;
         // Deletes first, so that files can replace directories and vice versa.
         for change in incoming.iter().filter(|c| c.new.is_none()) {
@@ -394,17 +615,23 @@ impl Workspace {
             }
             self.state.files.remove(&change.path);
         }
-        for change in &incoming {
-            let Some(state) = change.new else { continue };
-            let entry = if local.get(&change.path) == Some(&Some(state)) {
-                // Already identical on disk (e.g. our own committed change).
-                let meta = fs::symlink_metadata(self.fs_path(&change.path))?;
-                index_entry(&meta, state)
-            } else {
-                updated += 1;
-                self.write_file(&change.path, state)?
-            };
-            self.state.files.insert(change.path.clone(), entry);
+        let sets: Vec<(&RepoPath, FileState)> = incoming.iter().filter_map(|c| Some((&c.path, c.new?))).collect();
+        for batch in sets.chunks(CHECKOUT_BATCH) {
+            let is_local = |path: &RepoPath, state: FileState| local.get(path) == Some(&Some(state));
+            self.objects.prefetch_blobs(batch.iter().filter(|(p, s)| !is_local(p, *s)).map(|(_, s)| s.blob))?;
+            for &(path, state) in batch {
+                let entry = if is_local(path, state) {
+                    // Already identical on disk (e.g. our own committed change).
+                    let meta = fs::symlink_metadata(self.fs_path(path))?;
+                    index_entry(&meta, state)
+                } else {
+                    updated += 1;
+                    self.write_file(path, state)?
+                };
+                self.state.files.insert(path.clone(), entry);
+            }
+            // This batch is on disk, so its objects may be evicted.
+            self.trim_cache();
         }
         self.state.base = target.seq;
         self.state.base_root = target.root_tree;
@@ -432,8 +659,12 @@ impl Workspace {
 
     /// Discards local changes at or under `paths`, restoring the base revision.
     pub fn revert(&mut self, paths: &[RepoPath]) -> Result<Vec<LocalChange>> {
+        self.locked(|ws| ws.revert_unlocked(paths))
+    }
+
+    fn revert_unlocked(&mut self, paths: &[RepoPath]) -> Result<Vec<LocalChange>> {
         let changes: Vec<LocalChange> =
-            self.status()?.into_iter().filter(|c| paths.iter().any(|p| c.path.is_within(p))).collect();
+            self.status_unlocked()?.into_iter().filter(|c| paths.iter().any(|p| c.path.is_within(p))).collect();
         let restore: Vec<ObjectId> =
             changes.iter().filter_map(|c| self.state.files.get(&c.path).map(|e| e.state.blob)).collect();
         self.objects.prefetch_blobs(restore)?;
@@ -456,22 +687,24 @@ impl Workspace {
         if self.in_scope(&path) {
             return Ok(0);
         }
-        let mut sparse = self.config.sparse.clone();
-        sparse.push(path.clone());
-        self.config.sparse = normalize_sparse(sparse);
-        let count = self.materialize(&path)?;
-        self.save_config()?;
-        self.save_state()?;
-        Ok(count)
+        self.locked(|ws| {
+            let count = ws.materialize(&path)?;
+            let mut sparse = ws.config.sparse.clone();
+            sparse.push(path.clone());
+            ws.config.sparse = normalize_sparse(sparse);
+            ws.save_state()?;
+            ws.save_config()?;
+            Ok(count)
+        })
     }
 
     /// Checks out every untracked file under `prefix` at the base revision.
+    /// Refuses, before writing anything, to overwrite a different local file.
     fn materialize(&mut self, prefix: &RepoPath) -> Result<usize> {
         let files: Vec<(RepoPath, FileState)> = walk_files(&self.objects, self.state.base_root, prefix)?
             .into_iter()
             .filter(|(p, _)| !self.state.files.contains_key(p))
             .collect();
-        self.objects.prefetch_blobs(files.iter().map(|(_, s)| s.blob))?;
         for (path, state) in &files {
             let fs_path = self.fs_path(path);
             if let Ok(meta) = fs::symlink_metadata(&fs_path) {
@@ -482,16 +715,30 @@ impl Workspace {
                     bail!("{path} already exists locally with different content; move it aside first");
                 }
             }
-            let entry = self.write_file(path, *state)?;
-            self.state.files.insert(path.clone(), entry);
+        }
+        for batch in files.chunks(CHECKOUT_BATCH) {
+            self.objects.prefetch_blobs(batch.iter().map(|(_, s)| s.blob))?;
+            for (path, state) in batch {
+                let entry = self.write_file(path, *state)?;
+                self.state.files.insert(path.clone(), entry);
+            }
+            // This batch is on disk, so its objects may be evicted.
+            self.trim_cache();
         }
         Ok(files.len())
     }
 
     /// A unified diff of local changes against the base revision.
+    ///
+    /// A change of kind only (e.g. `chmod +x`) shows as `old kind:` and
+    /// `new kind:` lines, like git's `old mode`/`new mode`.
     pub fn diff(&mut self, only: &[RepoPath]) -> Result<String> {
+        self.locked(|ws| ws.diff_unlocked(only))
+    }
+
+    fn diff_unlocked(&mut self, only: &[RepoPath]) -> Result<String> {
         let mut out = String::new();
-        for change in self.status()? {
+        for change in self.status_unlocked()? {
             if !only.is_empty() && !only.iter().any(|p| change.path.is_within(p)) {
                 continue;
             }
@@ -514,10 +761,19 @@ impl Workspace {
                 ChangeKind::Deleted => "/dev/null".to_string(),
                 _ => format!("b/{}", change.path),
             };
+            out.push_str(&format!("diff {}\n", change.path));
+            let old_kind = self.state.files.get(&change.path).map(|e| e.state.kind);
+            if let (Some(old_kind), Some(new)) = (old_kind, change.new) {
+                if old_kind != new.kind {
+                    out.push_str(&format!("old kind: {}\nnew kind: {}\n", kind_name(old_kind), kind_name(new.kind)));
+                }
+            }
+            if old == new && change.kind == ChangeKind::Modified {
+                continue;
+            }
             match (text(&old), text(&new)) {
                 (Some(old), Some(new)) => {
                     let diff = similar::TextDiff::from_lines(old, new);
-                    out.push_str(&format!("diff {}\n", change.path));
                     out.push_str(&diff.unified_diff().context_radius(3).header(&old_name, &new_name).to_string());
                     if !out.ends_with('\n') {
                         out.push('\n');
@@ -583,6 +839,34 @@ fn normalize_sparse(mut sparse: Vec<RepoPath>) -> Vec<RepoPath> {
     let all = sparse.clone();
     sparse.retain(|p| !all.iter().any(|q| q != p && p.is_within(q)));
     sparse
+}
+
+fn kind_name(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::File => "file",
+        FileKind::Executable => "executable",
+        FileKind::Symlink => "symlink",
+    }
+}
+
+/// Undoes a failed clone: removes the directories it created, or empties the
+/// directory it was given (which was empty to begin with).
+fn remove_partial_clone(dir: &Path, created: Option<&Path>) -> std::io::Result<()> {
+    if let Some(top) = created {
+        return match fs::remove_dir_all(top) {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn text(data: &[u8]) -> Option<&str> {
