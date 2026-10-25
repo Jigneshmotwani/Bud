@@ -1,0 +1,22 @@
+[package]
+name = "budwood-import"
+description = "Import a git repository's first-parent history into a Budwood repository."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "budwood-import"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+budwood-client = { version = "0.1.0", path = "../budwood-client" }
+budwood-core = { version = "0.1.0", path = "../budwood-core" }
+clap = { version = "4.5.61", features = ["derive", "env"] }
+tempfile = "3.27.0"
+
+[dev-dependencies]
+budwood-server = { path = "../budwood-server" }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net"] }
