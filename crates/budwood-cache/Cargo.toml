@@ -1,0 +1,29 @@
+[package]
+name = "budwood-cache"
+description = "Budwood regional caching tier: a verified, read-through cache of immutable objects in front of a server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "budwood-cache"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+budwood-core = { version = "0.1.0", path = "../budwood-core" }
+clap = { version = "4.5.61", features = ["derive", "env"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "stream", "system-proxy"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+budwood-client = { path = "../budwood-client" }
+budwood-server = { path = "../budwood-server" }
+tempfile = "3.27.0"
