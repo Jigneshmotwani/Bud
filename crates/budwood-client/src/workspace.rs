@@ -119,11 +119,8 @@ impl Workspace {
         let head = remote.head().with_context(|| format!("contacting {server}"))?;
         fs::create_dir_all(dir.join(METADATA_DIR))?;
         let root = dir.canonicalize()?;
-        let config = Config {
-            server: remote.server().to_string(),
-            repo: repo.to_string(),
-            sparse: normalize_sparse(sparse),
-        };
+        let config =
+            Config { server: remote.server().to_string(), repo: repo.to_string(), sparse: normalize_sparse(sparse) };
         let objects = Objects::new(remote, root.join(METADATA_DIR).join("objects"))?;
         let state = State { base: head.seq, base_root: head.root_tree, files: BTreeMap::new() };
         let mut ws = Self { ignore: Ignore::load(&root)?, root, config, state, objects };
@@ -171,9 +168,7 @@ impl Workspace {
     /// Converts a filesystem path (absolute, or relative to `cwd`) to a repo path.
     pub fn repo_path(&self, cwd: &Path, arg: &str) -> Result<RepoPath> {
         let joined = normalize_lexically(&cwd.join(arg));
-        let relative = joined
-            .strip_prefix(&self.root)
-            .map_err(|_| anyhow!("{arg} is outside the workspace"))?;
+        let relative = joined.strip_prefix(&self.root).map_err(|_| anyhow!("{arg} is outside the workspace"))?;
         let text = relative
             .to_str()
             .ok_or_else(|| anyhow!("{arg} is not valid UTF-8"))?
@@ -195,9 +190,11 @@ impl Workspace {
     ///
     /// Takes `&mut self` because it refreshes stale stat data in the index.
     pub fn status(&mut self) -> Result<Vec<LocalChange>> {
+        // `.budignore` may have been checked out, synced or edited since open.
+        self.ignore = Ignore::load(&self.root)?;
         let mut disk = Vec::new();
         for prefix in &self.config.sparse {
-            self.collect_disk(prefix, &mut disk)?;
+            self.collect_disk(prefix, false, &mut disk)?;
         }
 
         let mut changes = Vec::new();
@@ -207,7 +204,12 @@ impl Workspace {
             let kind = platform::file_kind(&meta);
             let indexed = self.state.files.get(&path).copied();
             let state = match indexed {
-                Some(e) if e.mtime_ns != 0 && e.state.kind == kind && e.size == meta.len() && e.mtime_ns == mtime_ns(&meta) => {
+                Some(e)
+                    if e.mtime_ns != 0
+                        && e.state.kind == kind
+                        && e.size == meta.len()
+                        && e.mtime_ns == mtime_ns(&meta) =>
+                {
                     e.state
                 }
                 _ => {
@@ -222,7 +224,9 @@ impl Workspace {
                         refreshed.push((path.clone(), fresh));
                     }
                 }
-                Some(_) => changes.push(LocalChange { path: path.clone(), kind: ChangeKind::Modified, new: Some(state) }),
+                Some(_) => {
+                    changes.push(LocalChange { path: path.clone(), kind: ChangeKind::Modified, new: Some(state) })
+                }
                 None => changes.push(LocalChange { path: path.clone(), kind: ChangeKind::Added, new: Some(state) }),
             }
             found.insert(path);
@@ -249,7 +253,8 @@ impl Workspace {
     }
 
     /// Every file on disk at or under `path`, skipping ignored untracked ones.
-    fn collect_disk(&self, path: &RepoPath, out: &mut Vec<(RepoPath, fs::Metadata)>) -> Result<()> {
+    /// `ignored_dir` is set below an ignored directory that holds tracked files.
+    fn collect_disk(&self, path: &RepoPath, ignored_dir: bool, out: &mut Vec<(RepoPath, fs::Metadata)>) -> Result<()> {
         let fs_path = self.fs_path(path);
         let meta = match fs::symlink_metadata(&fs_path) {
             Ok(meta) => meta,
@@ -258,25 +263,26 @@ impl Workspace {
         };
         let tracked = self.state.files.contains_key(path);
         if meta.is_dir() {
-            if !path.is_root() && self.ignore.is_ignored(path, true) && !self.is_tracked_dir(path) {
+            let ignored = ignored_dir || (!path.is_root() && self.ignore.is_ignored(path, true));
+            if ignored && !self.is_tracked_dir(path) {
                 return Ok(());
             }
             let mut entries: Vec<_> = fs::read_dir(&fs_path)?.collect::<std::io::Result<_>>()?;
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
                 let name = entry.file_name();
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| anyhow!("{} has a non-UTF-8 name", entry.path().display()))?;
-                if path.is_root() && name == METADATA_DIR {
+                let name = name.to_str().ok_or_else(|| anyhow!("{} has a non-UTF-8 name", entry.path().display()))?;
+                // Ours, or a nested workspace's; never a repository path.
+                if name == METADATA_DIR {
                     continue;
                 }
-                self.collect_disk(&path.join(name)?, out)?;
+                self.collect_disk(&path.join(name)?, ignored, out)?;
             }
-        } else if (meta.is_file() || meta.file_type().is_symlink()) && !path.is_root() {
-            if tracked || !self.ignore.is_ignored(path, false) {
-                out.push((path.clone(), meta));
-            }
+        } else if (meta.is_file() || meta.file_type().is_symlink())
+            && !path.is_root()
+            && (tracked || !(ignored_dir || self.ignore.is_ignored(path, false)))
+        {
+            out.push((path.clone(), meta));
         }
         Ok(())
     }
@@ -321,7 +327,10 @@ impl Workspace {
         let resp = self.remote().commit(&req).map_err(|e| match e.downcast::<ApiError>() {
             Ok(api) if api.is_conflict() => {
                 let paths = list(&api.body.paths);
-                anyhow!("commit rejected: {} ({paths}). Run `bud sync` to pick up the newer changes, then commit again.", api.body.message)
+                anyhow!(
+                    "commit rejected: {} ({paths}). Run `bud sync` to pick up the newer changes, then commit again.",
+                    api.body.message
+                )
             }
             Ok(api) => api.into(),
             Err(e) => e,
@@ -329,9 +338,9 @@ impl Workspace {
 
         let seq = resp.changeset.seq;
         let target = Revision { seq, id: Some(resp.changeset.id), root_tree: resp.changeset.root_tree };
-        let update = self
-            .update_to(target)
-            .with_context(|| format!("committed revision {seq}, but could not update the working copy; run `bud sync`"))?;
+        let update = self.update_to(target).with_context(|| {
+            format!("committed revision {seq}, but could not update the working copy; run `bud sync`")
+        })?;
         Ok(CommitOutcome { changeset: resp.changeset, rebased: resp.rebased, pulled: update.updated })
     }
 
@@ -364,6 +373,7 @@ impl Workspace {
                                 .range(change.path.clone()..)
                                 .take_while(|(p, _)| p.as_str().starts_with(change.path.as_str()))
                                 .any(|(p, _)| p.is_within(&change.path) && *p != change.path))
+                        || self.untracked_differs(change)?
                 }
             };
             if collides {
@@ -402,25 +412,39 @@ impl Workspace {
         Ok(SyncOutcome { from, to: target.seq, updated })
     }
 
+    /// True if `change` would overwrite an ignored, untracked file on disk
+    /// that differs from the incoming one.
+    fn untracked_differs(&self, change: &Change) -> Result<bool> {
+        let Some(state) = change.new else {
+            return Ok(false);
+        };
+        if self.state.files.contains_key(&change.path) {
+            return Ok(false);
+        }
+        let fs_path = self.fs_path(&change.path);
+        let meta = match fs::symlink_metadata(&fs_path) {
+            Ok(meta) if !meta.is_dir() => meta,
+            _ => return Ok(false),
+        };
+        Ok(platform::file_kind(&meta) != state.kind
+            || ObjectId::for_blob(&read_content(&fs_path, &meta)?) != state.blob)
+    }
+
     /// Discards local changes at or under `paths`, restoring the base revision.
     pub fn revert(&mut self, paths: &[RepoPath]) -> Result<Vec<LocalChange>> {
-        let changes: Vec<LocalChange> = self
-            .status()?
-            .into_iter()
-            .filter(|c| paths.iter().any(|p| c.path.is_within(p)))
-            .collect();
-        let restore: Vec<ObjectId> = changes
-            .iter()
-            .filter_map(|c| self.state.files.get(&c.path).map(|e| e.state.blob))
-            .collect();
+        let changes: Vec<LocalChange> =
+            self.status()?.into_iter().filter(|c| paths.iter().any(|p| c.path.is_within(p))).collect();
+        let restore: Vec<ObjectId> =
+            changes.iter().filter_map(|c| self.state.files.get(&c.path).map(|e| e.state.blob)).collect();
         self.objects.prefetch_blobs(restore)?;
+        // Remove added files first, so that a file can replace a directory.
+        for change in changes.iter().filter(|c| !self.state.files.contains_key(&c.path)) {
+            self.remove_file(&change.path)?;
+        }
         for change in &changes {
-            match self.state.files.get(&change.path).map(|e| e.state) {
-                Some(state) => {
-                    let entry = self.write_file(&change.path, state)?;
-                    self.state.files.insert(change.path.clone(), entry);
-                }
-                None => self.remove_file(&change.path)?,
+            if let Some(state) = self.state.files.get(&change.path).map(|e| e.state) {
+                let entry = self.write_file(&change.path, state)?;
+                self.state.files.insert(change.path.clone(), entry);
             }
         }
         self.save_state()?;
@@ -569,10 +593,7 @@ fn text(data: &[u8]) -> Option<&str> {
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos() as i64)
+    meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i64)
 }
 
 fn index_entry(meta: &fs::Metadata, state: FileState) -> IndexEntry {
@@ -693,10 +714,7 @@ mod tests {
     #[test]
     fn sparse_normalization() {
         assert_eq!(normalize_sparse(vec![]), vec![RepoPath::root()]);
-        assert_eq!(
-            normalize_sparse(vec![path("a/b"), path("c"), path("a"), path("c")]),
-            vec![path("a"), path("c")]
-        );
+        assert_eq!(normalize_sparse(vec![path("a/b"), path("c"), path("a"), path("c")]), vec![path("a"), path("c")]);
     }
 
     #[test]

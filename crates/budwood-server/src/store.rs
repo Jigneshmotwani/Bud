@@ -111,9 +111,7 @@ impl TreeSink for Trees<'_> {
     fn put_tree(&self, tree: &Tree) -> budwood_core::Result<ObjectId> {
         let bytes = tree.encode();
         let id = ObjectId::for_tree(&bytes);
-        self.0
-            .put(&id, &bytes)
-            .map_err(|e| budwood_core::Error::Storage(format!("{e:#}")))?;
+        self.0.put(&id, &bytes).map_err(|e| budwood_core::Error::Storage(format!("{e:#}")))?;
         Ok(id)
     }
 }

@@ -54,11 +54,7 @@ impl Ignore {
     pub fn is_ignored(&self, path: &RepoPath, is_dir: bool) -> bool {
         self.patterns.iter().any(|p| {
             (is_dir || !p.dir_only)
-                && if p.anchored {
-                    glob_match(&p.glob, path.as_str())
-                } else {
-                    glob_match(&p.glob, path.file_name())
-                }
+                && if p.anchored { glob_match(&p.glob, path.as_str()) } else { glob_match(&p.glob, path.file_name()) }
         })
     }
 }

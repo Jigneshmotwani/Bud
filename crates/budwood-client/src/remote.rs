@@ -55,9 +55,7 @@ impl Remote {
     /// Creates a repository; returns false if it already existed.
     pub fn create_repo(server: &str, name: &str) -> Result<bool> {
         let server = server.trim_end_matches('/');
-        let req = http_client()?
-            .post(format!("{server}/v1/repos"))
-            .json(&CreateRepoRequest { name: name.to_string() });
+        let req = http_client()?.post(format!("{server}/v1/repos")).json(&CreateRepoRequest { name: name.to_string() });
         Ok(send(req)?.status() == reqwest::StatusCode::CREATED)
     }
 
@@ -81,10 +79,7 @@ impl Remote {
     }
 
     pub fn log(&self, path: &RepoPath, before: Option<u64>, limit: usize) -> Result<Vec<Changeset>> {
-        let mut req = self
-            .http
-            .get(self.url("log"))
-            .query(&[("path", path.as_str()), ("limit", &limit.to_string())]);
+        let mut req = self.http.get(self.url("log")).query(&[("path", path.as_str()), ("limit", &limit.to_string())]);
         if let Some(before) = before {
             req = req.query(&[("before", before)]);
         }
@@ -107,10 +102,7 @@ impl Remote {
     }
 
     pub fn diff(&self, from: &str, to: &str, path: &RepoPath) -> Result<DiffResponse> {
-        let req = self
-            .http
-            .get(self.url("diff"))
-            .query(&[("from", from), ("to", to), ("path", path.as_str())]);
+        let req = self.http.get(self.url("diff")).query(&[("from", from), ("to", to), ("path", path.as_str())]);
         Ok(send(req)?.json()?)
     }
 

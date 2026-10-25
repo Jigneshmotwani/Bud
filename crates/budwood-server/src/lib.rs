@@ -21,7 +21,5 @@ pub async fn serve(
     max_body_bytes: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, http::router(service, max_body_bytes))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(listener, http::router(service, max_body_bytes)).with_graceful_shutdown(shutdown).await
 }

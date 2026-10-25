@@ -53,9 +53,7 @@ async fn main() -> anyhow::Result<()> {
             for name in &repos {
                 service.create_repo(name)?;
             }
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .with_context(|| format!("binding {listen}"))?;
+            let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
             tracing::info!("listening on http://{}", listener.local_addr()?);
             serve(listener, service, max_body_bytes, async {
                 tokio::signal::ctrl_c().await.ok();

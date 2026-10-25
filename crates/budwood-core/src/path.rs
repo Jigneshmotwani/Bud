@@ -29,10 +29,7 @@ impl RepoPath {
             return Ok(Self::root());
         }
         for component in trimmed.split('/') {
-            validate_component(component).map_err(|reason| Error::InvalidPath {
-                path: path.clone(),
-                reason,
-            })?;
+            validate_component(component).map_err(|reason| Error::InvalidPath { path: path.clone(), reason })?;
         }
         Ok(Self(trimmed.to_string()))
     }
@@ -65,15 +62,8 @@ impl RepoPath {
     }
 
     pub fn join(&self, name: &str) -> Result<RepoPath, Error> {
-        validate_component(name).map_err(|reason| Error::InvalidPath {
-            path: name.to_string(),
-            reason,
-        })?;
-        Ok(if self.is_root() {
-            Self(name.to_string())
-        } else {
-            Self(format!("{}/{}", self.0, name))
-        })
+        validate_component(name).map_err(|reason| Error::InvalidPath { path: name.to_string(), reason })?;
+        Ok(if self.is_root() { Self(name.to_string()) } else { Self(format!("{}/{}", self.0, name)) })
     }
 
     /// Proper, non-root ancestors, nearest last: `a/b/c` yields `a`, `a/b`.

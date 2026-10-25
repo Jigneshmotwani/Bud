@@ -30,7 +30,11 @@ pub fn lookup<S: TreeSource + ?Sized>(src: &S, root: ObjectId, path: &RepoPath) 
 }
 
 /// Every file at or under `prefix`, sorted by path.
-pub fn walk_files<S: TreeSource + ?Sized>(src: &S, root: ObjectId, prefix: &RepoPath) -> Result<Vec<(RepoPath, FileState)>> {
+pub fn walk_files<S: TreeSource + ?Sized>(
+    src: &S,
+    root: ObjectId,
+    prefix: &RepoPath,
+) -> Result<Vec<(RepoPath, FileState)>> {
     let mut out = Vec::new();
     if let Some(entry) = lookup(src, root, prefix)? {
         walk_entry(src, prefix, entry, &mut out)?;
@@ -59,7 +63,12 @@ fn walk_entry<S: TreeSource + ?Sized>(
 ///
 /// Subtrees with equal ids are skipped without being read, so the cost is
 /// proportional to what changed, not to the size of the repository.
-pub fn diff_trees<S: TreeSource + ?Sized>(src: &S, from: ObjectId, to: ObjectId, prefix: &RepoPath) -> Result<Vec<Change>> {
+pub fn diff_trees<S: TreeSource + ?Sized>(
+    src: &S,
+    from: ObjectId,
+    to: ObjectId,
+    prefix: &RepoPath,
+) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     if from != to {
         let a = lookup(src, from, prefix)?;
@@ -121,13 +130,8 @@ fn diff_entries<S: TreeSource + ?Sized>(
 /// exist and [`Error::PathConflict`] when a change would treat a file as a
 /// directory or vice versa. Directories left empty are removed.
 pub fn apply_changes<S: TreeSink + ?Sized>(sink: &S, root: ObjectId, changes: &[Change]) -> Result<ObjectId> {
-    let pending: Vec<Pending<'_>> = changes
-        .iter()
-        .map(|change| Pending {
-            components: change.path.components().collect(),
-            change,
-        })
-        .collect();
+    let pending: Vec<Pending<'_>> =
+        changes.iter().map(|change| Pending { components: change.path.components().collect(), change }).collect();
     if pending.iter().any(|p| p.components.is_empty()) {
         return Err(Error::InvalidChanges("cannot change the repository root".into()));
     }
@@ -284,7 +288,8 @@ mod tests {
     #[test]
     fn apply_and_walk() {
         let store = MemTrees::default();
-        let root = apply_changes(&store, empty_tree_id(), &[set("a/b/c.txt", "1"), set("a/d.txt", "2"), set("e", "3")]).unwrap();
+        let root = apply_changes(&store, empty_tree_id(), &[set("a/b/c.txt", "1"), set("a/d.txt", "2"), set("e", "3")])
+            .unwrap();
         assert_eq!(
             files(&store, root),
             vec![("a/b/c.txt".into(), file("1")), ("a/d.txt".into(), file("2")), ("e".into(), file("3"))]
@@ -314,10 +319,7 @@ mod tests {
     fn rejects_bad_applications() {
         let store = MemTrees::default();
         let root = apply_changes(&store, empty_tree_id(), &[set("a/b", "1")]).unwrap();
-        assert!(matches!(
-            apply_changes(&store, root, &[Change::delete(path("nope"))]),
-            Err(Error::PathNotFound(_))
-        ));
+        assert!(matches!(apply_changes(&store, root, &[Change::delete(path("nope"))]), Err(Error::PathNotFound(_))));
         assert!(matches!(apply_changes(&store, root, &[set("a", "x")]), Err(Error::PathConflict { .. })));
         assert!(matches!(apply_changes(&store, root, &[set("a/b/c", "x")]), Err(Error::PathConflict { .. })));
     }
@@ -342,13 +344,20 @@ mod tests {
     #[test]
     fn diff_round_trips() {
         let store = MemTrees::default();
-        let a = apply_changes(&store, empty_tree_id(), &[set("src/main.rs", "1"), set("src/lib.rs", "2"), set("README", "3")]).unwrap();
-        let b = apply_changes(&store, a, &[set("src/main.rs", "1b"), Change::delete(path("README")), set("docs/x.md", "4")]).unwrap();
+        let a = apply_changes(
+            &store,
+            empty_tree_id(),
+            &[set("src/main.rs", "1"), set("src/lib.rs", "2"), set("README", "3")],
+        )
+        .unwrap();
+        let b = apply_changes(
+            &store,
+            a,
+            &[set("src/main.rs", "1b"), Change::delete(path("README")), set("docs/x.md", "4")],
+        )
+        .unwrap();
         let changes = diff_trees(&store, a, b, &RepoPath::root()).unwrap();
-        assert_eq!(
-            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
-            ["README", "docs/x.md", "src/main.rs"]
-        );
+        assert_eq!(changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["README", "docs/x.md", "src/main.rs"]);
         assert_eq!(apply_changes(&store, a, &changes).unwrap(), b);
 
         let scoped = diff_trees(&store, a, b, &path("src")).unwrap();

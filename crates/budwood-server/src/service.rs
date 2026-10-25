@@ -70,7 +70,8 @@ impl Service {
     }
 
     pub fn create_repo(&self, name: &str) -> ServiceResult<bool> {
-        validate_repo_name(name).map_err(|reason| ServiceError::BadRequest(format!("invalid repo name {name:?}: {reason}")))?;
+        validate_repo_name(name)
+            .map_err(|reason| ServiceError::BadRequest(format!("invalid repo name {name:?}: {reason}")))?;
         Ok(self.meta.create_repo(name, now())?)
     }
 
@@ -120,9 +121,7 @@ impl Service {
         if revision.seq == 0 {
             return Err(ServiceError::NotFound("revision 0 is the empty repository".into()));
         }
-        self.meta
-            .by_seq(repo, revision.seq)?
-            .ok_or_else(|| ServiceError::NotFound(format!("no revision {rev:?}")))
+        self.meta.by_seq(repo, revision.seq)?.ok_or_else(|| ServiceError::NotFound(format!("no revision {rev:?}")))
     }
 
     pub fn log(&self, repo: &str, path: &RepoPath, before: Option<u64>, limit: usize) -> ServiceResult<Vec<Changeset>> {
@@ -137,9 +136,7 @@ impl Service {
             .ok_or_else(|| ServiceError::NotFound(format!("{path} does not exist at revision {}", revision.seq)))?;
         let entries = if entry.kind == EntryKind::Tree {
             let tree = self.trees().get_tree(&entry.id).map_err(internal)?;
-            tree.iter()
-                .map(|(name, e)| ListEntry { name: name.to_string(), kind: e.kind, id: e.id })
-                .collect()
+            tree.iter().map(|(name, e)| ListEntry { name: name.to_string(), kind: e.kind, id: e.id }).collect()
         } else {
             Vec::new()
         };
@@ -162,9 +159,7 @@ impl Service {
     }
 
     fn load(&self, id: &ObjectId) -> ServiceResult<Vec<u8>> {
-        self.objects
-            .get(id)?
-            .ok_or_else(|| ServiceError::NotFound(format!("object {id} not found")))
+        self.objects.get(id)?.ok_or_else(|| ServiceError::NotFound(format!("object {id} not found")))
     }
 
     pub fn get_object(&self, repo: &str, id: &ObjectId) -> ServiceResult<Vec<u8>> {
@@ -382,10 +377,7 @@ mod tests {
     #[test]
     fn rejects_mismatched_blob() {
         let svc = service();
-        assert!(matches!(
-            svc.put_blob("r", &ObjectId::for_blob(b"a"), b"b"),
-            Err(ServiceError::BadRequest(_))
-        ));
+        assert!(matches!(svc.put_blob("r", &ObjectId::for_blob(b"a"), b"b"), Err(ServiceError::BadRequest(_))));
     }
 
     #[test]

@@ -72,10 +72,7 @@ impl Objects {
     /// Ensures all `ids` are cached, fetching the missing ones in batches.
     pub fn prefetch_blobs(&self, ids: impl IntoIterator<Item = ObjectId>) -> Result<()> {
         let mut seen = HashSet::new();
-        let wanted: Vec<ObjectId> = ids
-            .into_iter()
-            .filter(|id| seen.insert(*id) && !self.path(id).exists())
-            .collect();
+        let wanted: Vec<ObjectId> = ids.into_iter().filter(|id| seen.insert(*id) && !self.path(id).exists()).collect();
         if wanted.is_empty() {
             return Ok(());
         }

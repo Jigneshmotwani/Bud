@@ -86,11 +86,7 @@ fn parse_id(id: &str) -> Result<ObjectId, ApiError> {
 
 fn bytes_response(data: Vec<u8>, immutable: bool) -> Response {
     let cache = if immutable { "public, max-age=31536000, immutable" } else { "no-cache" };
-    (
-        [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, cache)],
-        data,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, cache)], data).into_response()
 }
 
 async fn list_repos(State(svc): Svc) -> Result<Json<RepoList>, ApiError> {
@@ -114,7 +110,11 @@ struct LogQuery {
     limit: Option<usize>,
 }
 
-async fn log(State(svc): Svc, Path(repo): Path<String>, Query(q): Query<LogQuery>) -> Result<Json<LogResponse>, ApiError> {
+async fn log(
+    State(svc): Svc,
+    Path(repo): Path<String>,
+    Query(q): Query<LogQuery>,
+) -> Result<Json<LogResponse>, ApiError> {
     let path = parse_path(q.path)?;
     let limit = q.limit.unwrap_or(50);
     let changesets = blocking(svc, move |s| s.log(&repo, &path, q.before, limit)).await?;
@@ -125,14 +125,13 @@ async fn changeset(State(svc): Svc, Path((repo, rev)): Path<(String, String)>) -
     Ok(Json(blocking(svc, move |s| s.changeset(&repo, &rev)).await?))
 }
 
-async fn commit(State(svc): Svc, Path(repo): Path<String>, Json(req): Json<CommitRequest>) -> Result<Json<CommitResponse>, ApiError> {
+async fn commit(
+    State(svc): Svc,
+    Path(repo): Path<String>,
+    Json(req): Json<CommitRequest>,
+) -> Result<Json<CommitResponse>, ApiError> {
     let resp = blocking(svc, move |s| s.commit(&repo, req)).await?;
-    tracing::info!(
-        seq = resp.changeset.seq,
-        files = resp.changeset.changes.len(),
-        rebased = resp.rebased,
-        "committed"
-    );
+    tracing::info!(seq = resp.changeset.seq, files = resp.changeset.changes.len(), rebased = resp.rebased, "committed");
     Ok(Json(resp))
 }
 
@@ -142,7 +141,11 @@ struct RevQuery {
     path: Option<String>,
 }
 
-async fn tree(State(svc): Svc, Path(repo): Path<String>, Query(q): Query<RevQuery>) -> Result<Json<TreeResponse>, ApiError> {
+async fn tree(
+    State(svc): Svc,
+    Path(repo): Path<String>,
+    Query(q): Query<RevQuery>,
+) -> Result<Json<TreeResponse>, ApiError> {
     let path = parse_path(q.path)?;
     let rev = q.rev.unwrap_or_default();
     Ok(Json(blocking(svc, move |s| s.tree(&repo, &rev, &path)).await?))
@@ -162,7 +165,11 @@ struct DiffQuery {
     path: Option<String>,
 }
 
-async fn diff(State(svc): Svc, Path(repo): Path<String>, Query(q): Query<DiffQuery>) -> Result<Json<DiffResponse>, ApiError> {
+async fn diff(
+    State(svc): Svc,
+    Path(repo): Path<String>,
+    Query(q): Query<DiffQuery>,
+) -> Result<Json<DiffResponse>, ApiError> {
     let path = parse_path(q.path)?;
     let to = q.to.unwrap_or_default();
     Ok(Json(blocking(svc, move |s| s.diff(&repo, &q.from, &to, &path)).await?))
@@ -184,7 +191,11 @@ async fn get_object(State(svc): Svc, Path((repo, id)): Path<(String, String)>) -
     Ok(bytes_response(data, true))
 }
 
-async fn put_object(State(svc): Svc, Path((repo, id)): Path<(String, String)>, body: Bytes) -> Result<StatusCode, ApiError> {
+async fn put_object(
+    State(svc): Svc,
+    Path((repo, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
     blocking(svc, move |s| s.put_blob(&repo, &id, &body)).await?;
     Ok(StatusCode::NO_CONTENT)

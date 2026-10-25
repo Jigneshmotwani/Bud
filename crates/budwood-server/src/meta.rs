@@ -71,11 +71,7 @@ impl MetaStore {
     }
 
     pub fn repo_exists(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row("SELECT 1 FROM repos WHERE name = ?1", [name], |_| Ok(()))
-            .optional()?
-            .is_some())
+        Ok(self.conn().query_row("SELECT 1 FROM repos WHERE name = ?1", [name], |_| Ok(())).optional()?.is_some())
     }
 
     pub fn list_repos(&self) -> Result<Vec<String>> {
@@ -87,10 +83,7 @@ impl MetaStore {
 
     /// The newest changeset, or `None` if the repository is empty.
     pub fn head(&self, repo: &str) -> Result<Option<Changeset>> {
-        self.one(
-            "SELECT body FROM changesets WHERE repo = ?1 ORDER BY seq DESC LIMIT 1",
-            params![repo],
-        )
+        self.one("SELECT body FROM changesets WHERE repo = ?1 ORDER BY seq DESC LIMIT 1", params![repo])
     }
 
     pub fn by_seq(&self, repo: &str, seq: u64) -> Result<Option<Changeset>> {
@@ -137,11 +130,8 @@ impl MetaStore {
     pub fn append(&self, repo: &str, cs: &Changeset) -> Result<Result<(), HeadMoved>> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let head: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM changesets WHERE repo = ?1",
-            [repo],
-            |row| row.get(0),
-        )?;
+        let head: i64 =
+            tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM changesets WHERE repo = ?1", [repo], |row| row.get(0))?;
         if head as u64 + 1 != cs.seq {
             return Ok(Err(HeadMoved));
         }
@@ -168,8 +158,6 @@ impl MetaStore {
         let conn = self.conn();
         let mut stmt = conn.prepare(sql)?;
         let bodies = stmt.query_map(params, |row| row.get::<_, String>(0))?;
-        bodies
-            .map(|b| serde_json::from_str(&b?).context("decoding changeset"))
-            .collect()
+        bodies.map(|b| serde_json::from_str(&b?).context("decoding changeset")).collect()
     }
 }
