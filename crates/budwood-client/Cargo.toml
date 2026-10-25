@@ -1,0 +1,26 @@
+[package]
+name = "budwood-client"
+description = "Budwood client library and `bud` command-line tool."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bud"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+budwood-core = { version = "0.1.0", path = "../budwood-core" }
+clap = { version = "4.5.61", features = ["derive", "env"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "query", "rustls", "system-proxy"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+similar = "2.7.0"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+budwood-server = { path = "../budwood-server" }
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net"] }
